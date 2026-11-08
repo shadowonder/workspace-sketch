@@ -1,12 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Badge, Button, Checkbox, Group, Loader, MantineProvider, NativeSelect,
-  Paper, Tabs, Text, Textarea, TextInput, useMantineColorScheme,
+  Tabs, Text, TextInput, useMantineColorScheme,
 } from '@mantine/core';
-import { Clipboard } from '@wailsio/runtime';
+import Editor from './Editor.jsx';
+import SchemaRegistry from './SchemaRegistry.jsx';
 import { StringService } from '../bindings/github.com/shadowonder/fast-chrome-plugin/tool-hatch';
 
-const tools = [{ id: 'string', label: 'String', component: StringTool }];
+const tools = [
+  { id: 'string', label: 'String', component: StringTool },
+  { id: 'schema-registry', label: 'Schema Registry', component: SchemaRegistry },
+];
+const tabStorageKey = 'toolhatch.active-tab';
+function savedTab() {
+  try {
+    const id = window.localStorage.getItem(tabStorageKey);
+    return tools.some((tool) => tool.id === id) ? id : 'string';
+  } catch { return 'string'; }
+}
 const operations = [{ value: 'avro-to-plain', label: 'Avro JSON → Plain JSON' }];
 const theme = {
   primaryColor: 'blue',
@@ -24,11 +35,15 @@ export default function App() {
 }
 
 function Tools() {
-  const [activeTool, setActiveTool] = useState('string');
+  const [activeTool, setActiveTool] = useState(savedTab);
+  const [registryVisited, setRegistryVisited] = useState(() => savedTab() === 'schema-registry');
+  useEffect(() => {
+    try { window.localStorage.setItem(tabStorageKey, activeTool); } catch { /* Preference storage is optional. */ }
+  }, [activeTool]);
   const { colorScheme, setColorScheme } = useMantineColorScheme();
 
   return (
-    <Tabs className="app" value={activeTool} onChange={setActiveTool} keepMounted={false}>
+    <Tabs className="app" value={activeTool} onChange={(id) => { if (tools.some((tool) => tool.id === id)) { if (id === 'schema-registry') setRegistryVisited(true); setActiveTool(id); } }} keepMounted={false} keepMountedMode="display-none">
       <header className="app-header">
         <Group gap="md" wrap="nowrap">
           <Text size="xs" c="dimmed" fw={600}>TOOLS</Text>
@@ -41,7 +56,7 @@ function Tools() {
           data={[{ value: 'auto', label: 'System' }, { value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }]} />
       </header>
       {tools.map(({ id, component: Tool }) => (
-        <Tabs.Panel key={id} value={id} className="tool-panel"><Tool /></Tabs.Panel>
+        <Tabs.Panel key={id} value={id} className="tool-panel" keepMounted={id === 'schema-registry' && registryVisited}><Tool {...(id === 'schema-registry' ? { active: activeTool === id } : {})} /></Tabs.Panel>
       ))}
     </Tabs>
   );
@@ -153,59 +168,5 @@ function StringTool() {
         </div>
       )}
     </div>
-  );
-}
-
-function CopyIcon() {
-  return <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
-    <rect x="8" y="8" width="12" height="12" rx="2" />
-    <path d="M16 8V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h4" />
-  </svg>;
-}
-
-function Editor({ name, value, readOnly = false, canCopy = true, busy = false, onChange }) {
-  const [copyState, setCopyState] = useState('idle');
-  const copyId = useRef(0);
-  useEffect(() => {
-    copyId.current += 1;
-    setCopyState('idle');
-    return () => { copyId.current += 1; };
-  }, [value, canCopy]);
-  useEffect(() => {
-    if (copyState !== 'copied' && copyState !== 'error') return;
-    const timer = setTimeout(() => setCopyState('idle'), 2200);
-    return () => clearTimeout(timer);
-  }, [copyState]);
-
-  async function copy() {
-    const id = ++copyId.current;
-    setCopyState('copying');
-    try {
-      await Clipboard.SetText(value);
-      if (id === copyId.current) setCopyState('copied');
-    } catch {
-      if (id === copyId.current) setCopyState('error');
-    }
-  }
-
-  return (
-    <Paper withBorder radius="md" className="editor">
-      <Group className="editor-header" justify="space-between" gap="xs" wrap="nowrap">
-        <Text component="label" htmlFor={`${name.toLowerCase()}-editor`} size="xs" fw={600}>{name}</Text>
-        <Group gap={6} wrap="nowrap">
-          <Text size="xs" c="red" role="status" title={copyState === 'error' ? 'Select text and use Cmd/Ctrl+C to copy.' : undefined}>{copyState === 'error' ? 'Copy failed' : ''}</Text>
-          <Button size="compact-xs" variant="subtle" leftSection={<CopyIcon />}
-            aria-label={`Copy ${name}`} disabled={!canCopy || copyState === 'copying'}
-            color={copyState === 'copied' ? 'green' : 'gray'} onClick={() => void copy()}>
-            {copyState === 'copied' ? 'Copied' : 'Copy'}
-          </Button>
-        </Group>
-      </Group>
-      <Textarea id={`${name.toLowerCase()}-editor`} value={value} readOnly={readOnly}
-        onChange={onChange} spellCheck={false} autoCapitalize="off" autoCorrect="off"
-        aria-busy={busy} variant="unstyled"
-        classNames={{ root: 'editor-field', wrapper: 'editor-wrapper', input: 'editor-input' }}
-        placeholder={readOnly ? 'Processed text appears here' : 'Enter text to process…'} />
-    </Paper>
   );
 }

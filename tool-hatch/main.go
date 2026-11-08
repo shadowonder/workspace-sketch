@@ -16,6 +16,8 @@ func main() {
 		Description: "A collection of local developer utilities",
 		Services: []application.Service{
 			application.NewService(&StringService{}),
+			application.NewService(&RegistryService{}),
+			application.NewService(NewProfileService()),
 		},
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),

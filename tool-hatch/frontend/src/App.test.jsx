@@ -7,6 +7,8 @@ import { Clipboard } from '@wailsio/runtime';
 
 vi.mock('../bindings/github.com/shadowonder/fast-chrome-plugin/tool-hatch', () => ({
   StringService: { Process: vi.fn() },
+  RegistryService: { Fetch: vi.fn(), Schema: vi.fn() },
+  ProfileService: { List: vi.fn().mockResolvedValue({ success: true, message: '', profiles: [], selectedID: '', config: null, credentialAvailable: true }), Apply: vi.fn(), Save: vi.fn(), Delete: vi.fn(), SaveDefault: vi.fn() },
 }));
 
 vi.mock('@wailsio/runtime', () => ({ Clipboard: { SetText: vi.fn() } }));

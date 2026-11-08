@@ -34,7 +34,8 @@ def verify(archive):
     with tempfile.TemporaryDirectory(prefix='toolhatch-verify-') as folder:
         subprocess.run(['ditto', '-x', '-k', str(archive), folder], check=True)
         app = Path(folder) / 'ToolHatch.app'
-        subprocess.run(['lipo', str(app / 'Contents/MacOS/ToolHatch'), '-verify_arch', 'arm64', 'x86_64'], check=True)
+        for arch in ['arm64', 'x86_64']:
+            subprocess.run(['lipo', str(app / 'Contents/MacOS/ToolHatch'), '-verify_arch', arch], check=True)
         subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
     print(f'Verified Universal, signed ToolHatch.app with icon in {archive.name}')
 

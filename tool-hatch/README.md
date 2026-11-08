@@ -1,12 +1,40 @@
 # ToolHatch
 
-An independent local-first Go + Wails v3 desktop utility with a compact Mantine/React/Vite frontend. The String tab currently exposes only **Avro JSON → Plain JSON**. Input and Namespace Prefix changes run automatically through Go; check **Manual apply** to run only with **Apply**. Output is read-only, with green Done or a red failure reason. Copy actions and System/Light/Dark themes remain; text is not persisted.
+An independent local-first Go + Wails v3 desktop utility with a compact Mantine/React/Vite frontend. The String tab exposes **Avro JSON → Plain JSON**; the **Schema Registry** tab browses a topic’s value-schema versions through Go. Input and Namespace Prefix changes run automatically through Go; check **Manual apply** to run only with **Apply**. Output is read-only, with green Done or a red failure reason. Copy actions and System/Light/Dark themes remain; text is not persisted.
 
 The converter recursively unwraps recognized Avro union labels using documented type/value-shape rules. It preserves ambiguous objects, precision-sensitive numbers, field order and schema-like definitions. Conversion is **schema-free and best-effort**, not guaranteed equivalent to full Avro deserialization; metadata warnings are displayed under the status. No schema input/resolution, schema normalization or Avro Parsing Canonical Form is implemented.
 
 Examples: {"string":"hello"} becomes the JSON string "hello"; {"long":9007199254740993} becomes 9007199254740993. Unknown single-key business objects keep their keys. Set optional **Namespace Prefix** below Input to restrict named-type unwrapping (for example, com.example. matches com.example.Address). Empty uses the original automatic detection of qualified names and narrow PascalCase-like simple names. A nonempty prefix uses only literal matching, without heuristic fallback; primitives convert in either mode. Configured-prefix matching is exact, literal and case-sensitive, without trimming, regex or automatic separators; record/enum value-shape checks still apply. Nonmatching object keys remain, with recursive conversion of nested values; ambiguous/mismatched cases are preserved and reported. Actual map/record payload containers remain intact.
 
 Each editor header copies its entire current string through the native clipboard. Output Copy is enabled only for a current successful result. Native selection/keyboard copying remain available; prefix text is not included in editor copies or persisted. Mantine persists only the theme preference.
+
+## Schema Registry
+
+Configuration uses two compact inline-label rows: URL/Fetch first, then a nearly full-width editable Topic input. Profile and SSL are thin divider-style sections, both initially collapsed; only their title/status is shown until expanded. Subject labels in the Versions sidebar and schema header are right aligned and preserve the end when space is limited; tooltips expose the full subject. Topic input scrolls horizontally without changing the request value.
+
+Enter a required Schema Registry URL (`http://` or `https://`, optionally with a base path) and Topic Name. Press **Enter** or **Fetch** to retrieve `<topic>-value` versions, newest first; the latest is selected automatically. Select a sidebar version to load its formatted read-only Avro schema and use **Copy** for the whole schema. This tool makes only GET requests; it never registers, changes or deletes schemas. Schema references are displayed as returned, not resolved or normalized.
+
+**SSL configuration** is collapsed initially. Leave Keystore Path, Truststore Path and Password all empty for ordinary HTTP/HTTPS with system trust. Any partial configuration lists the missing fields. Custom SSL requires HTTPS and all three fields; the indicator reports field completeness, not certificate validity. TLS is verified during each request.
+
+Supported local files (read by Go, not the frontend):
+
+- Keystore: `.jks` containing exactly one private-key entry and certificate chain; `.p12`/`.pfx` containing a private key and certificate chain; or combined `.pem` containing a certificate chain and unencrypted private key.
+- Truststore: `.jks` trusted-certificate entries; Java-compatible trusted-certificate `.p12`/`.pfx`; or CA certificates in `.pem`/`.crt`. Configured trust replaces system roots for that connection.
+- Native `.jks` files are decoded directly in Go; no conversion to P12 or PEM files is needed. Password is shared by both stores and JKS private keys. It is still required when enabling SSL with PEM files; unencrypted PEM itself does not use it. Encrypted PEM keys are unsupported—use PKCS#12/JKS instead. Multiple JKS private-key aliases and separate key passwords are not supported.
+
+TLS 1.2+ retains chain/hostname validation; there is no insecure bypass. Requests time out after 20 seconds each, do not follow redirects, and accept at most 4 MiB per response; local files are regular files up to 16 MiB. Errors describe missing inputs/files, store/password problems, TLS, HTTP 401/403/404 and invalid responses without displaying raw server bodies or credentials. HTTP Basic/Bearer login is not implemented; the Password field unlocks SSL files, not HTTP authentication. Do not embed credentials in the URL.
+
+### Profile v1
+
+Expand **Profile** to select/apply a connection, **Save** a named profile, **Save As** a new one, or **Delete** a named profile. Selecting a target does not apply it; **Not applied** blocks Fetch until Apply or selection back to the current profile. Applying a named profile replaces URL, both SSL paths and Password while keeping Topic. Unsaved named edits still require discard confirmation. Last applied/saved selection and active tab are restored.
+
+**Default Profile** replaces the old temporary Manual mode. It is built in, cannot be deleted, and automatically saves connection changes without Save. Empty and incomplete URL/SSL drafts are retained; Fetch still enforces URL/topic and all-or-empty SSL validation. Inline credentials/query/fragment are not saved in Default URLs. Topic is never saved. The status indicator shows Saving, Saved or Attention; wait for Saved before quitting. Writes are serialized, keeping the latest snapshot when edits arrive during a save. Editing a named profile never autosaves into Default; deleting the active named profile restores the separately stored Default rather than copying named inputs into it.
+
+Complete profiles, including the shared SSL password, live in `os.UserConfigDir()/ToolHatch/registry-profiles.json` (macOS `~/Library/Application Support/ToolHatch/`). This is ordinary local JSON, not encrypted storage: protect the file and its backups. ToolHatch never logs credentials or stores them in localStorage. Atomic tempfile/sync/rename writes use 0600 files and restrict the dedicated app directory to 0700 where supported. No OS credential manager is used for profiles; application code signing is separate.
+
+Version3 stores Default and named passwords directly. Version1/2 connection settings and selected IDs migrate on the next successful write. Old Keychain passwords are neither read nor deleted: affected profiles show a re-entry warning until Password is explicitly entered and saved. Default nonsecret edits preserve its saved password or legacy re-entry marker. Corrupt data is not silently overwritten. A failed autosave keeps inputs and shows Attention; Default Save permits retry. If restoration failed, fix storage and Apply again before autosave is enabled, preventing blind overwrites.
+
+Named saves retain strict URL/SSL completeness checks; Default stores drafts. Limits remain 100 named profiles plus Default, 1 MiB metadata, 120-byte names and 1024-byte passwords. New named profiles cannot use the reserved Default Profile name; any legacy named profile with that name is shown as `(named)`. Profile sync/export/import, multiple-process coordination, HTTP Basic/Bearer auth and quit-time save interception are outside scope. Drafts persist in memory across tab navigation; Topic and unsaved named edits disappear on quit. Only active-tab ID/theme live in localStorage.
 
 ## Prerequisites
 
@@ -34,11 +62,13 @@ wails3 dev
 The development workflow generates bindings, installs frontend dependencies with `npm ci`, builds Go in development mode, starts Vite on loopback port 9245, and launches the native window. Frontend changes use Vite; Go changes rebuild the application. To change the port, use `wails3 dev -port 9246`.
 
 ```sh
-wails3 build       # production frontend and native executable in bin/
+wails3 build       # production frontend and thin host executable in bin/native/
 wails3 task run    # launch the built application
 # macOS only, optional: create a local .app without launching it
 wails3 task mac:bundle
 ```
+
+Host/development builds use `bin/native/ToolHatch`; Universal slices/output use `bin/universal/`. Packaging never leaves a fat executable in the native output, so `wails3 dev` can run immediately afterward. The legacy `bin/ToolHatch` file is no longer read or overwritten.
 
 On macOS, the run task creates and signs `bin/ToolHatch.app` (configured local identity or ad-hoc fallback). No separate Task installation is needed; `wails3` runs the Taskfile.
 
@@ -51,7 +81,7 @@ wails3 task darwin:package:zip
 python3 scripts/verify-macos-archive.py bin/ToolHatch-macos-universal.zip
 ```
 
-The existing Taskfile follows the [Wails v3 Universal packaging pattern](https://v3.wails.io/guides/build/macos/), building architectures sequentially while sharing generated frontend assets. The ZIP contains `ToolHatch.app`, including its executable, branded `.icns`, bundle metadata and signature. `ditto` preserves bundle structure and executable permissions. Verification extracts the actual archive and checks application identity, icon, both architectures, code signature and absence of workspace/development documents. Only this ZIP is distributed; the raw executable is not an application bundle.
+The existing Taskfile follows the [Wails v3 Universal packaging pattern](https://v3.wails.io/guides/build/macos/), building architectures sequentially under `bin/universal/` while sharing generated frontend assets. The release bundle/ZIP names remain unchanged; `mac:bundle` normally bundles the native executable and Universal packaging explicitly supplies its own binary. The ZIP contains `ToolHatch.app`, including its executable, branded `.icns`, bundle metadata and signature. `ditto` preserves bundle structure and executable permissions. Verification extracts the actual archive and checks application identity, icon, both architectures, code signature and absence of workspace/development documents. Only this ZIP is distributed; the raw executable is not an application bundle.
 
 ### Optional local signing
 
@@ -95,8 +125,10 @@ The workflow must be present on `main`, and repository/org policy must allow Act
 - `main.go`: embedded frontend, Wails service registration and one window.
 - `stringservice.go`: processing dispatch, retained legacy operations and response metadata.
 - `avrojson.go`: ordered schema-free union-wrapper conversion and warnings.
+- `profileservice.go`: versioned complete local profiles, permission-restricted atomic writes and explicit storage errors.
+- `registryservice.go`, `registrytls.go`: read-only Schema Registry HTTP/formatting and local TLS stores; `registryservice_test.go` includes HTTP and mutual-TLS fixtures.
 - `stringservice_test.go`, `avrojson_test.go`: legacy operation, conversion/boundary and response-contract checks.
-- `frontend/`: React components, CSS, generated binding imports, npm lockfile, Vite and focused UI tests.
+- `frontend/`: React tool tabs, shared Editor/Copy, transient registry interaction, stable active-tab preference, generated binding imports, npm lockfile, Vite and focused UI tests.
 - `Taskfile.yml`, `build/config.yml`: native build and development workflow.
 - `build/darwin/Info.plist`: ToolHatch bundle identity, identifier `io.github.shadowonder.toolhatch` (bundle version currently 0.1.0; push releases use separate run identifiers).
 - `build/appicon.svg`, `build/appicon.png`, `build/darwin/icon.icns`: editable source and packaged icon assets.
@@ -115,7 +147,7 @@ cd frontend
 npm test
 ```
 
-Tests retain legacy operations and cover primitive/named wrappers, map/record containers, ambiguity/schema preservation, precision/order, malformed JSON, response warnings, literal namespace matching/empty-prefix/nested preservation, prefix automatic/manual behavior, request ordering/failures, clipboard, themes and StrictMode replay. UI tests mock the Wails boundary; native launch checks are separate. Windows/Linux and real GitHub publication remain unverified. Current native test evidence and limitations live in the local ignored workspace status/history.
+Tests retain legacy operations and cover primitive/named wrappers, map/record containers, ambiguity/schema preservation, precision/order, malformed JSON, response warnings, literal namespace matching/empty-prefix/nested preservation, prefix automatic/manual behavior, request ordering/failures, clipboard, themes and StrictMode replay. Registry tests additionally cover versions/errors/path escaping and real local mutual TLS for PEM/PKCS#12/JKS, including untrusted CA/hostname rejection. UI tests cover registry ordering, copy, stale requests, SSL visibility, long topics, profile restoration/confirmation/CRUD/errors and active-tab persistence. Go profile tests use temporary local files, verify complete password restoration, permissions, migration/re-entry, named/Default isolation and failure handling. Tests and application profile persistence never access a credential manager. UI tests mock the Wails boundary; native launch checks are separate. Windows/Linux and real GitHub publication remain unverified. Current native test evidence and limitations live in the local ignored workspace status/history.
 
 The Go response is `{ result, metadata: { operation, success, message } }`. Preserve this contract; metadata is also reserved for future optional content information such as JSON detection and format details, which are not implemented yet. The optional warnings string array is implemented for best-effort conversion limits; required outcome fields remain unchanged. Input/operation/mode changes clear previous output and invalidate in-flight requests; only the latest applicable response can update the interface.
 
