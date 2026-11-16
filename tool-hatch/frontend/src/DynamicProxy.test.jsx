@@ -8,7 +8,7 @@ vi.mock('../bindings/github.com/shadowonder/fast-chrome-plugin/tool-hatch', () =
   StringService: { Process: vi.fn().mockResolvedValue({ result: '', metadata: { success: true, operation: 'avro-to-plain', message: 'Done' } }) },
   RegistryService: { Fetch: vi.fn(), Schema: vi.fn() },
   ProfileService: { List: vi.fn(), Apply: vi.fn(), Save: vi.fn(), Delete: vi.fn(), SaveDefault: vi.fn() },
-  ProxyService: { ListConfigs: vi.fn(), SaveDraft: vi.fn(), SaveConfig: vi.fn(), DeleteConfig: vi.fn(), Start: vi.fn(), Stop: vi.fn(), Status: vi.fn() },
+  ProxyService: { ListConfigs: vi.fn(), SaveDraft: vi.fn(), SaveConfig: vi.fn(), DeleteConfig: vi.fn(), Start: vi.fn(), Stop: vi.fn(), Status: vi.fn(), Console: vi.fn(), ClearConsole: vi.fn() },
 }));
 vi.mock('@wailsio/runtime', () => ({ Clipboard: { SetText: vi.fn() } }));
 Object.defineProperty(window, 'matchMedia', { writable: true, value: vi.fn().mockImplementation(() => ({ matches: false, addEventListener() {}, removeEventListener() {} })) });
@@ -188,4 +188,86 @@ it('applies a slow Start response even when a poll overlapping it resolves first
   await act(async () => finishStart()); await flush();
   expect(serverState()).toBe('Running');
   expect(button('Stop')).toBeDefined();
+});
+
+const logEntry = (id, level, message) => ({ id, time: `2026-11-15T10:20:3${id}.12${id}-06:00`, level, message });
+const consoleButton = () => container.querySelector('[aria-controls="proxy-console-output"]');
+const consoleLines = () => [...container.querySelectorAll('.console-entry')].map((row) => row.textContent);
+async function repoll() { await click(tab('String')); await click(tab('Dynamic Proxy')); await flush(); }
+function consoleBackend(entries) {
+  ProxyService.Console.mockImplementation(async (after) => ({ entries: entries.filter((e) => e.id > after), lastID: entries.at(-1)?.id ?? 0, truncated: false }));
+}
+
+it('places a collapsed Console below Activity and fetches entries only when the Go cursor advances', async () => {
+  const entries = [logEntry(1, 'log', 'path /x 42'), logEntry(2, 'warn', 'careful'), logEntry(3, 'error', 'Error: bad')];
+  consoleBackend(entries);
+  await openProxy();
+  const side = container.querySelector('.proxy-side');
+  expect([...side.children].map((e) => e.getAttribute('aria-label'))).toEqual(['Request activity', 'Script console']);
+  expect(consoleButton().getAttribute('aria-expanded')).toBe('false');
+  expect(container.querySelector('#proxy-console-output')).toBeNull();
+  expect(ProxyService.Console).not.toHaveBeenCalled(); // cursor 0: nothing to fetch
+
+  goState = { ...goState, consoleLastID: 3 };
+  await repoll();
+  expect(ProxyService.Console).toHaveBeenCalledTimes(1);
+  expect(ProxyService.Console).toHaveBeenLastCalledWith(0);
+  expect(container.querySelector('[aria-label="Console entry count"]').textContent).toBe('3');
+  await click(consoleButton());
+  expect(consoleLines()).toEqual(['10:20:31.121logpath /x 42', '10:20:32.122warncareful', '10:20:33.123errorError: bad']);
+
+  await repoll(); await repoll(); // unchanged cursor: no extra Console calls
+  expect(ProxyService.Console).toHaveBeenCalledTimes(1);
+  entries.push(logEntry(4, 'debug', 'later'));
+  goState = { ...goState, consoleLastID: 4 };
+  await repoll();
+  expect(ProxyService.Console).toHaveBeenLastCalledWith(3);
+  expect(consoleLines().at(-1)).toContain('debuglater');
+});
+
+it('keeps Console independent of Activity and Start/Stop when collapsing, expanding and clearing', async () => {
+  const entries = [logEntry(1, 'info', 'loaded')];
+  consoleBackend(entries);
+  ProxyService.ClearConsole.mockResolvedValue({ entries: [], lastID: 1, truncated: false });
+  goState = { ...stopped, running: true, address: 'http://127.0.0.1:8080', target: 't', requests: 1, consoleLastID: 1,
+    activity: [{ id: 1, time: '', method: 'GET', path: '/ok', status: 200, durationMs: 1, error: '' }] };
+  await openProxy();
+  await click(consoleButton());
+  expect(container.querySelector('.proxy-console').getAttribute('data-open')).toBe('true');
+  await click(consoleButton());
+  expect(container.querySelector('.proxy-console').getAttribute('data-open')).toBe('false');
+  expect(container.querySelector('#proxy-console-output')).toBeNull();
+  expect(ProxyService.Stop).not.toHaveBeenCalled(); expect(ProxyService.Start).not.toHaveBeenCalled();
+  expect(serverState()).toBe('Running');
+  expect(container.querySelectorAll('.activity-entry')).toHaveLength(1);
+
+  // Logging continues while collapsed.
+  entries.push(logEntry(2, 'log', 'while collapsed'));
+  goState = { ...goState, consoleLastID: 2 };
+  await repoll();
+  expect(container.querySelector('[aria-label="Console entry count"]').textContent).toBe('2');
+
+  // A fetch still in flight when Clear is pressed must not repopulate the view.
+  let late;
+  ProxyService.Console.mockImplementationOnce(() => new Promise((resolve) => { late = resolve; }));
+  entries.push(logEntry(3, 'log', 'raced'));
+  goState = { ...goState, consoleLastID: 3 };
+  await repoll();
+  await click(consoleButton());
+  await click(button('Clear')); await flush();
+  expect(ProxyService.ClearConsole).toHaveBeenCalledTimes(1);
+  await act(async () => late({ entries: [entries[2]], lastID: 3, truncated: false }));
+  expect(consoleLines()).toEqual([]);
+  expect(container.querySelector('[aria-label="Console entry count"]').textContent).toBe('0');
+  expect(container.querySelectorAll('.activity-entry')).toHaveLength(1);
+  expect(ProxyService.Stop).not.toHaveBeenCalled();
+});
+
+it('reports discarded console entries', async () => {
+  ProxyService.Console.mockResolvedValue({ entries: [logEntry(9, 'log', 'tail')], lastID: 9, truncated: true });
+  goState = { ...goState, consoleLastID: 9 };
+  await openProxy();
+  await click(consoleButton());
+  expect(container.querySelector('#proxy-console-output').textContent).toContain('Older entries were discarded');
+  expect(consoleLines()).toEqual(['10:20:39.129logtail']);
 });

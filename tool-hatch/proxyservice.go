@@ -55,6 +55,8 @@ type ProxyStatus struct {
 	Failures  int64           `json:"failures"`
 	LastError string          `json:"lastError"`
 	Activity  []ProxyActivity `json:"activity"`
+	// ConsoleLastID lets the UI fetch console entries only when new ones exist.
+	ConsoleLastID int64 `json:"consoleLastID"`
 }
 
 type ProxyService struct {
@@ -74,6 +76,9 @@ type ProxyService struct {
 
 	storeMu   sync.Mutex
 	storePath string
+
+	// console is independent of Start/Stop and Activity; it survives restarts.
+	console proxyConsole
 }
 
 const proxyActivityLimit = 100
@@ -155,7 +160,7 @@ func (s *ProxyService) Start(config ProxyConfig) ProxyStatus {
 	if err != nil {
 		return s.statusWith(false, err.Error())
 	}
-	program, err := compileProxyScript(config.Script)
+	program, err := compileProxyScript(config.Script, s.console.add)
 	if err != nil {
 		return s.statusWith(false, err.Error())
 	}
@@ -175,7 +180,7 @@ func (s *ProxyService) Start(config ProxyConfig) ProxyStatus {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &http.Server{
-		Handler:           newProxyHandler(route, program, s.record),
+		Handler:           newProxyHandler(route, program, s.record, s.console.add),
 		ReadHeaderTimeout: 15 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ErrorLog:          log.New(io.Discard, "", 0), // never log request data
@@ -225,6 +230,12 @@ func (s *ProxyService) Stop() ProxyStatus {
 
 func (s *ProxyService) Status() ProxyStatus { return s.statusWith(true, "") }
 
+// Console returns script console entries with ID greater than afterID.
+func (s *ProxyService) Console(afterID int64) ProxyConsoleResponse { return s.console.since(afterID) }
+
+// ClearConsole discards buffered console entries; IDs keep increasing.
+func (s *ProxyService) ClearConsole() ProxyConsoleResponse { return s.console.clear() }
+
 func (s *ProxyService) isRunning() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -237,6 +248,7 @@ func (s *ProxyService) statusWith(success bool, message string) ProxyStatus {
 	status := ProxyStatus{Success: success, Message: message, Running: s.server != nil, Requests: s.requests,
 		Failures: s.failures, LastError: s.lastError, Activity: make([]ProxyActivity, len(s.activity))}
 	copy(status.Activity, s.activity)
+	status.ConsoleLastID = s.console.last()
 	if status.Running {
 		status.Address, status.Target = s.address, s.target
 	}
@@ -264,13 +276,14 @@ type proxyHandler struct {
 	client  *http.Client // script http.request calls; redirects are returned, not followed
 	proxy   *httputil.ReverseProxy
 	record  func(ProxyActivity)
+	log     func(level, message string)
 }
 
 type proxyErrorKey struct{}
 
-func newProxyHandler(route proxyRoute, program *goja.Program, record func(ProxyActivity)) *proxyHandler {
+func newProxyHandler(route proxyRoute, program *goja.Program, record func(ProxyActivity), logConsole func(level, message string)) *proxyHandler {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	h := &proxyHandler{route: route, program: program, record: record,
+	h := &proxyHandler{route: route, program: program, record: record, log: logConsole,
 		client: &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone(),
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	h.proxy = &httputil.ReverseProxy{
@@ -321,7 +334,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	if h.program != nil {
-		if err := runProxyScript(out.Context(), h.program, h.client, out); err != nil {
+		if err := runProxyScript(out.Context(), h.program, h.client, h.log, out); err != nil {
 			failure := &scriptFailure{http.StatusInternalServerError, err.Error()}
 			errors.As(err, &failure)
 			entry.Error = failure.message

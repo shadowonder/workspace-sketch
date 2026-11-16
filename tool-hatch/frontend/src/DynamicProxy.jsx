@@ -3,6 +3,7 @@ import { Badge, Button, Collapse, Group, Loader, Modal, NativeSelect, Paper, Tex
 import { ProxyService } from '../bindings/github.com/shadowonder/fast-chrome-plugin/tool-hatch';
 import Editor from './Editor.jsx';
 import Icon from './RegistryIcon.jsx';
+import ProxyConsole from './ProxyConsole.jsx';
 
 // Go owns the server, forwarding, streaming, script execution and persistence.
 // React keeps the editable draft, mirrors the polled Go status and never sees
@@ -13,6 +14,7 @@ export const defaultScript = `// onRequest runs before each request is forwarded
 // req.query(name), req.setQuery(name, value), req.removeQuery(name)
 // http.request({ url, method, headers, body, timeoutMs })
 //   -> { status, statusText, headers, body, header(name), json() }
+// console.log/info/warn/error/debug(...) -> Console panel (memory only; avoid printing secrets)
 // Throwing an error rejects the request with HTTP 500 instead of forwarding it.
 function onRequest(req) {
   // Example: obtain a token and attach it.
@@ -53,7 +55,7 @@ export default function DynamicProxy({ active = true }) {
   const [loaded, setLoaded] = useState(false);
   const [mappingOpen, setMappingOpen] = useState(false);
   const [savedOpen, setSavedOpen] = useState(false);
-  const [server, setServer] = useState({ running: false, address: '', target: '', requests: 0, failures: 0, lastError: '', activity: [] });
+  const [server, setServer] = useState({ running: false, address: '', target: '', requests: 0, failures: 0, lastError: '', activity: [], consoleLastID: 0 });
   const [action, setAction] = useState({ busy: false, message: 'Stopped.', error: false });
   const [startedWith, setStartedWith] = useState(null);
   const [saved, setSaved] = useState([]);
@@ -64,14 +66,19 @@ export default function DynamicProxy({ active = true }) {
   const actionEpoch = useRef(0);
   const acting = useRef(false);
   const draftQueue = useRef({ running: false, pending: null });
+  const shownStatus = useRef('');
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 
   // Start/Stop responses are authoritative. A poll is discarded if any action
   // was issued or completed while it was in flight (e.g. a poll racing Stop).
+  // Identical polls (the idle case) do not re-render the tab.
   const showStatus = useCallback((status) => {
-    setServer(status);
     if (!status.running) setStartedWith(null);
+    const key = JSON.stringify(status);
+    if (key === shownStatus.current) return;
+    shownStatus.current = key;
+    setServer(status);
   }, []);
   const poll = useCallback(async () => {
     const issued = actionEpoch.current;
@@ -247,6 +254,7 @@ export default function DynamicProxy({ active = true }) {
     <div className="proxy-results">
       <Editor name="onRequest Script" value={config.script} onChange={(e) => edit('script', e.target.value)}
         placeholder="Empty script: requests are forwarded unchanged." />
+      <div className="proxy-side">
       <Paper withBorder radius="md" className="proxy-activity" aria-label="Request activity">
         <div className="versions-heading">
           <Text size="xs" fw={600}>Activity</Text>
@@ -268,6 +276,8 @@ export default function DynamicProxy({ active = true }) {
           {!activity.length && <div className="versions-empty"><Icon name="connection" size={22} /><Text size="xs" c="dimmed">{server.running ? 'Waiting for requests…' : 'Start the proxy to see requests.'}</Text></div>}
         </div>
       </Paper>
+      <ProxyConsole lastID={server.consoleLastID ?? 0} />
+      </div>
     </div>
     <Modal opened={confirmLoad !== null} onClose={() => setConfirmLoad(null)} title="Replace unsaved draft?" size="sm" centered>
       <Text size="sm">Loading “{confirmLoad}” replaces the current draft, which is not saved under a name.</Text>

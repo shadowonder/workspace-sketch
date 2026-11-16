@@ -112,7 +112,7 @@ func TestValidateProxyConfig(t *testing.T) {
 }
 
 func TestCompileProxyScriptValidation(t *testing.T) {
-	if program, err := compileProxyScript("  \n"); program != nil || err != nil {
+	if program, err := compileProxyScript("  \n", nil); program != nil || err != nil {
 		t.Fatal("empty script must mean plain forwarding")
 	}
 	for script, want := range map[string]string{
@@ -123,11 +123,11 @@ func TestCompileProxyScriptValidation(t *testing.T) {
 		"http.request({url:'http://127.0.0.1:1'}); function onRequest(){}": "only available while onRequest runs",
 		"while (true) {} function onRequest(){}":                           "time limit",
 	} {
-		if _, err := compileProxyScript(script); err == nil || !strings.Contains(err.Error(), want) {
+		if _, err := compileProxyScript(script, nil); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("script %q: got %v, want %q", script, err, want)
 		}
 	}
-	if _, err := compileProxyScript(strings.Repeat(" ", proxyScriptMaxBytes) + "function onRequest(){}"); err == nil {
+	if _, err := compileProxyScript(strings.Repeat(" ", proxyScriptMaxBytes)+"function onRequest(){}", nil); err == nil {
 		t.Error("oversized script accepted")
 	}
 }
