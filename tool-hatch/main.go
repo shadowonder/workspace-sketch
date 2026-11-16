@@ -18,6 +18,7 @@ func main() {
 			application.NewService(&StringService{}),
 			application.NewService(&RegistryService{}),
 			application.NewService(NewProfileService()),
+			application.NewService(NewProxyService()),
 		},
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),

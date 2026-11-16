@@ -1,6 +1,6 @@
 # ToolHatch
 
-An independent local-first Go + Wails v3 desktop utility with a compact Mantine/React/Vite frontend. The String tab exposes **Avro JSON → Plain JSON**; the **Schema Registry** tab browses a topic’s value-schema versions through Go. Input and Namespace Prefix changes run automatically through Go; check **Manual apply** to run only with **Apply**. Output is read-only, with green Done or a red failure reason. Copy actions and System/Light/Dark themes remain; text is not persisted.
+An independent local-first Go + Wails v3 desktop utility with a compact Mantine/React/Vite frontend. The String tab exposes **Avro JSON → Plain JSON**; the **Schema Registry** tab browses a topic’s value-schema versions through Go; the **Dynamic Proxy** tab runs a local programmable HTTP reverse proxy. Input and Namespace Prefix changes run automatically through Go; check **Manual apply** to run only with **Apply**. Output is read-only, with green Done or a red failure reason. Copy actions and System/Light/Dark themes remain; text is not persisted.
 
 The converter recursively unwraps recognized Avro union labels using documented type/value-shape rules. It preserves ambiguous objects, precision-sensitive numbers, field order and schema-like definitions. Conversion is **schema-free and best-effort**, not guaranteed equivalent to full Avro deserialization; metadata warnings are displayed under the status. No schema input/resolution, schema normalization or Avro Parsing Canonical Form is implemented.
 
@@ -35,6 +35,42 @@ Complete profiles, including the shared SSL password, live in `os.UserConfigDir(
 Version3 stores Default and named passwords directly. Version1/2 connection settings and selected IDs migrate on the next successful write. Old Keychain passwords are neither read nor deleted: affected profiles show a re-entry warning until Password is explicitly entered and saved. Default nonsecret edits preserve its saved password or legacy re-entry marker. Corrupt data is not silently overwritten. A failed autosave keeps inputs and shows Attention; Default Save permits retry. If restoration failed, fix storage and Apply again before autosave is enabled, preventing blind overwrites.
 
 Named saves retain strict URL/SSL completeness checks; Default stores drafts. Limits remain 100 named profiles plus Default, 1 MiB metadata, 120-byte names and 1024-byte passwords. New named profiles cannot use the reserved Default Profile name; any legacy named profile with that name is shown as `(named)`. Profile sync/export/import, multiple-process coordination, HTTP Basic/Bearer auth and quit-time save interception are outside scope. Drafts persist in memory across tab navigation; Topic and unsaved named edits disappear on quit. Only active-tab ID/theme live in localStorage.
+
+## Dynamic Proxy
+
+A local, programmable HTTP reverse proxy implemented in Go. Enter a **Local Port** (the proxy always listens on `127.0.0.1` only) and a **Target** of the form `http(s)://host[:port]`, then click **Start**. The status badge shows the actual Go server state (polled every second while the tab is visible); the proxy keeps running while you use other tabs and stops when ToolHatch quits. Configuration and script are validated before the port is opened; port conflicts, permission errors and script errors are reported without starting. Edits made while running take effect only after Stop/Start.
+
+Requests are forwarded with Go's `httputil.ReverseProxy`: method, path, query string, headers and body are preserved (hop-by-hop headers are handled by Go, `Host` is set to the target, no `X-Forwarded-*` headers are added). Responses are passed through unchanged. Streaming responses, including `text/event-stream` (SSE), are flushed to the client as they arrive and never pass through JavaScript; Stop ends open streams promptly. Upstream TLS uses the system trust store with full verification.
+
+**Path Mapping** (collapsed, optional): with Source Path `/api` and Target Path `/v2`, `/api/users?x=1` is forwarded as `/v2/users?x=1` and `/api` as `/v2`. Matching uses whole path segments, so `/apix` does not match and, like every non-matching path, is forwarded unchanged. Both fields are required together.
+
+**onRequest script** (optional; empty means plain forwarding). The script runs in an embedded [Goja](https://github.com/dop251/goja) JavaScript engine (ES5.1+ with most ES2015+ features; no Node.js APIs, modules, timers or `console`). Each request gets a fresh runtime; top-level code runs each time, so keep it to declarations. `function onRequest(req)` may be `async`.
+
+| API | Behavior |
+| --- | --- |
+| `req.method`, `req.path` | Writable strings; the path is the escaped path after mapping and must start with `/` |
+| `req.header(name)`, `req.headers()` | Case-insensitive lookup / snapshot object of all headers |
+| `req.setHeader(name, value)`, `req.removeHeader(name)` | Modify outgoing headers |
+| `req.query(name)`, `req.setQuery(name, value)`, `req.removeQuery(name)` | Query parameters; the original query string is kept byte-for-byte unless modified |
+| `req.body` | Read/write UTF-8 string, max 10 MiB. Unread bodies stream through untouched; reading buffers the body and it is re-sent with a correct `Content-Length` (bytes preserved exactly if not assigned) |
+| `http.request({ url, method, headers, body, timeoutMs })` | Synchronous Go-backed HTTP call; object `body` is sent as JSON. Returns `{ status, statusText, headers, body, header(name), json() }`. Redirects are returned, not followed |
+
+```js
+function onRequest(req) {
+  const r = http.request({ method: 'POST', url: 'https://sso.example.internal/token', body: { client: 'cli' } });
+  if (r.status !== 200) throw new Error('token request failed: ' + r.status);
+  req.setHeader('Authorization', 'Bearer ' + r.json().access_token);
+  const body = JSON.parse(req.body);
+  body.model = 'my-model';
+  req.body = JSON.stringify(body);
+}
+```
+
+Limits: one `onRequest` call (including its HTTP calls) may take 20 s; each `http.request` defaults to 10 s, at most 8 calls per request, 4 MiB response bodies; scripts up to 256 KiB. A thrown error, timeout or invalid change answers the client with HTTP 500 (413 for an oversized body) and header `X-ToolHatch-Proxy-Error: script`; an unreachable target answers 502 with `X-ToolHatch-Proxy-Error: upstream`. Nothing is forwarded after a script failure. Bodies are not decompressed for scripts, and response bodies cannot be transformed.
+
+**Activity** lists the last 100 requests (method, forwarded path without query string, status, duration, error) plus request/failure counters. Headers, query strings and bodies are never recorded or logged.
+
+**Saved Configurations**: the current draft (port, target, mapping, script) autosaves and is restored on launch; **Save** stores a named configuration (same name replaces it), **Load** replaces the whole draft (confirming if the draft is not saved under any name), **Delete** removes it. Data lives in `os.UserConfigDir()/ToolHatch/proxy-configs.json` with the same private atomic writes as profiles (0600 file, 0700 directory). Scripts may contain secrets: this is plain local JSON, so protect the file and its backups.
 
 ## Prerequisites
 
@@ -127,6 +163,7 @@ The workflow must be present on `main`, and repository/org policy must allow Act
 - `avrojson.go`: ordered schema-free union-wrapper conversion and warnings.
 - `profileservice.go`: versioned complete local profiles, permission-restricted atomic writes and explicit storage errors.
 - `registryservice.go`, `registrytls.go`: read-only Schema Registry HTTP/formatting and local TLS stores; `registryservice_test.go` includes HTTP and mutual-TLS fixtures.
+- `proxyservice.go`, `proxyscript.go`: Dynamic Proxy lifecycle/forwarding/path mapping/activity/saved configurations and the Goja `onRequest` runtime with its `http.request` helper; `proxyservice_test.go` uses real loopback servers.
 - `stringservice_test.go`, `avrojson_test.go`: legacy operation, conversion/boundary and response-contract checks.
 - `frontend/`: React tool tabs, shared Editor/Copy, transient registry interaction, stable active-tab preference, generated binding imports, npm lockfile, Vite and focused UI tests.
 - `Taskfile.yml`, `build/config.yml`: native build and development workflow.
@@ -147,7 +184,7 @@ cd frontend
 npm test
 ```
 
-Tests retain legacy operations and cover primitive/named wrappers, map/record containers, ambiguity/schema preservation, precision/order, malformed JSON, response warnings, literal namespace matching/empty-prefix/nested preservation, prefix automatic/manual behavior, request ordering/failures, clipboard, themes and StrictMode replay. Registry tests additionally cover versions/errors/path escaping and real local mutual TLS for PEM/PKCS#12/JKS, including untrusted CA/hostname rejection. UI tests cover registry ordering, copy, stale requests, SSL visibility, long topics, profile restoration/confirmation/CRUD/errors and active-tab persistence. Go profile tests use temporary local files, verify complete password restoration, permissions, migration/re-entry, named/Default isolation and failure handling. Tests and application profile persistence never access a credential manager. UI tests mock the Wails boundary; native launch checks are separate. Windows/Linux and real GitHub publication remain unverified. Current native test evidence and limitations live in the local ignored workspace status/history.
+Tests retain legacy operations and cover primitive/named wrappers, map/record containers, ambiguity/schema preservation, precision/order, malformed JSON, response warnings, literal namespace matching/empty-prefix/nested preservation, prefix automatic/manual behavior, request ordering/failures, clipboard, themes and StrictMode replay. Registry tests additionally cover versions/errors/path escaping and real local mutual TLS for PEM/PKCS#12/JKS, including untrusted CA/hostname rejection. UI tests cover registry ordering, copy, stale requests, SSL visibility, long topics, profile restoration/confirmation/CRUD/errors and active-tab persistence. Proxy Go tests cover path mapping, validation, unchanged forwarding, script request transformation with an outbound call, binary bodies, script errors/timeouts, upstream failure, start/stop/port conflict/restart, SSE streaming and stop during an open stream, and saved-configuration storage; proxy UI tests cover start/stop state, polling races, autosave and saved configurations. Go profile tests use temporary local files, verify complete password restoration, permissions, migration/re-entry, named/Default isolation and failure handling. Tests and application profile persistence never access a credential manager. UI tests mock the Wails boundary; native launch checks are separate. Windows/Linux and real GitHub publication remain unverified. Current native test evidence and limitations live in the local ignored workspace status/history.
 
 The Go response is `{ result, metadata: { operation, success, message } }`. Preserve this contract; metadata is also reserved for future optional content information such as JSON detection and format details, which are not implemented yet. The optional warnings string array is implemented for best-effort conversion limits; required outcome fields remain unchanged. Input/operation/mode changes clear previous output and invalidate in-flight requests; only the latest applicable response can update the interface.
 

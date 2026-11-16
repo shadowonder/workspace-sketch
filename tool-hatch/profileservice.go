@@ -180,15 +180,21 @@ func (s *ProfileService) write(data profileFile) error {
 	if err != nil || len(raw) > 1<<20 {
 		return errors.New("Profile data exceeds the storage limit.")
 	}
-	if err = os.MkdirAll(filepath.Dir(s.path), 0700); err != nil {
-		return errors.New("Cannot create profile storage directory.")
+	return writePrivateFile(s.path, raw, "profile")
+}
+
+// writePrivateFile atomically replaces path (tempfile, sync, rename) with a
+// 0600 file inside a 0700 app directory. noun names the storage in messages.
+func writePrivateFile(path string, raw []byte, noun string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return errors.New("Cannot create " + noun + " storage directory.")
 	}
-	if err = os.Chmod(filepath.Dir(s.path), 0700); err != nil {
-		return errors.New("Cannot restrict profile directory permissions.")
+	if err := os.Chmod(filepath.Dir(path), 0700); err != nil {
+		return errors.New("Cannot restrict " + noun + " directory permissions.")
 	}
-	f, err := os.CreateTemp(filepath.Dir(s.path), ".profiles-*")
+	f, err := os.CreateTemp(filepath.Dir(path), "."+noun+"-*")
 	if err != nil {
-		return errors.New("Cannot write profile storage.")
+		return errors.New("Cannot write " + noun + " storage.")
 	}
 	defer os.Remove(f.Name())
 	defer f.Close()
@@ -202,10 +208,10 @@ func (s *ProfileService) write(data profileFile) error {
 		err = closeErr
 	}
 	if err == nil {
-		err = os.Rename(f.Name(), s.path)
+		err = os.Rename(f.Name(), path)
 	}
 	if err != nil {
-		return errors.New("Cannot save profile storage. Existing profile data was left unchanged.")
+		return errors.New("Cannot save " + noun + " storage. Existing " + noun + " data was left unchanged.")
 	}
 	return nil
 }

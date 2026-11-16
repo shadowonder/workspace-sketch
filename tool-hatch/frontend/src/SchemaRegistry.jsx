@@ -133,7 +133,7 @@ export default function SchemaRegistry({ active = true }) {
       <Paper withBorder className="registry-versions" radius="md" component="nav" aria-label="Schema versions">
         <div className="versions-heading"><Text size="xs" fw={600}>Versions</Text><Badge size="xs" variant="light" color="gray">{versions.length}</Badge></div>
         <SubjectTail subject={subject} label="Versions subject" />
-        <div className="version-list">
+        <div className="version-list" aria-label="Version list">
           {versions.map((version) => <Button key={version} variant={selected === version ? 'light' : 'subtle'} size="xs" fullWidth
             className={selected === version ? 'version-selected' : ''} leftSection={<Icon name="file" size={13} />}
             disabled={profileBusy} aria-pressed={selected === version} onClick={() => void load(version)}>v{version}</Button>)}

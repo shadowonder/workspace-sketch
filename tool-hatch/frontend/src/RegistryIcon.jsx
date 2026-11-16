@@ -9,6 +9,8 @@ const paths = {
   check: 'm4 10 4 4 8-8',
   alert: 'M10 3 1 17h18L10 3Zm0 5v4m0 2v1',
   chevron: 'm7 4 6 6-6 6',
+  play: 'M6 4v12l10-6L6 4Z',
+  stop: 'M5 5h10v10H5z',
 };
 export default function RegistryIcon({ name, size = 15 }) {
   return <svg width={size} height={size} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[name] || paths.file} /></svg>;

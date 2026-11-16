@@ -87,6 +87,25 @@ it('fetches on form submit (Enter), selects latest, switches versions and copies
  await click(button('v1')); expect(requests[1].version).toBe(1); expect(schema().value).toBe('');
  await reply(1, { version: 1, schema: '"string"' }); expect(schema().value).toBe('"string"');
 });
+it('keeps the version list and its scroll position when selecting from many versions', async () => {
+ await registry(); await config(); await submit();
+ await reply(0, { versions: Array.from({ length: 150 }, (_,index) => 150 - index), version: 150 });
+ const list = container.querySelector('[aria-label="Version list"]');
+ const heading = container.querySelector('.versions-heading');
+ expect(list.contains(heading)).toBe(false);
+ expect(list.querySelectorAll('button')).toHaveLength(150);
+ list.scrollTop = 840;
+ await click(button('v90'));
+ expect(container.querySelector('[aria-label="Version list"]')).toBe(list);
+ expect(list.scrollTop).toBe(840);
+ expect(button('v90').getAttribute('aria-pressed')).toBe('true');
+ expect(button('v90').classList.contains('version-selected')).toBe(true);
+ expect(button('v150').getAttribute('aria-pressed')).toBe('false');
+ await reply(1, { version: 90, schema: '"selected"' });
+ expect(list.scrollTop).toBe(840);
+ expect(schema().value).toBe('"selected"');
+ expect(schema().closest('.registry-versions')).toBeNull();
+});
 it('rejects stale fetch/version successes and failures, including edits and tab changes', async () => {
  await registry(); await config(); await submit(); await submit();
  await reply(1, { versions: [3, 1] }); await reply(0, { versions: [99], version: 99, schema: '"old"' });

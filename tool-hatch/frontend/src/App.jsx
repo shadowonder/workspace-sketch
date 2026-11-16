@@ -5,12 +5,16 @@ import {
 } from '@mantine/core';
 import Editor from './Editor.jsx';
 import SchemaRegistry from './SchemaRegistry.jsx';
+import DynamicProxy from './DynamicProxy.jsx';
 import { StringService } from '../bindings/github.com/shadowonder/fast-chrome-plugin/tool-hatch';
 
 const tools = [
   { id: 'string', label: 'String', component: StringTool },
   { id: 'schema-registry', label: 'Schema Registry', component: SchemaRegistry },
+  { id: 'dynamic-proxy', label: 'Dynamic Proxy', component: DynamicProxy },
 ];
+// These tools keep their in-memory drafts once visited and receive `active`.
+const keptTools = ['schema-registry', 'dynamic-proxy'];
 const tabStorageKey = 'toolhatch.active-tab';
 function savedTab() {
   try {
@@ -36,14 +40,14 @@ export default function App() {
 
 function Tools() {
   const [activeTool, setActiveTool] = useState(savedTab);
-  const [registryVisited, setRegistryVisited] = useState(() => savedTab() === 'schema-registry');
+  const [visited, setVisited] = useState(() => [savedTab()]);
   useEffect(() => {
     try { window.localStorage.setItem(tabStorageKey, activeTool); } catch { /* Preference storage is optional. */ }
   }, [activeTool]);
   const { colorScheme, setColorScheme } = useMantineColorScheme();
 
   return (
-    <Tabs className="app" value={activeTool} onChange={(id) => { if (tools.some((tool) => tool.id === id)) { if (id === 'schema-registry') setRegistryVisited(true); setActiveTool(id); } }} keepMounted={false} keepMountedMode="display-none">
+    <Tabs className="app" value={activeTool} onChange={(id) => { if (tools.some((tool) => tool.id === id)) { setVisited((list) => (list.includes(id) ? list : [...list, id])); setActiveTool(id); } }} keepMounted={false} keepMountedMode="display-none">
       <header className="app-header">
         <Group gap="md" wrap="nowrap">
           <Text size="xs" c="dimmed" fw={600}>TOOLS</Text>
@@ -56,7 +60,7 @@ function Tools() {
           data={[{ value: 'auto', label: 'System' }, { value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }]} />
       </header>
       {tools.map(({ id, component: Tool }) => (
-        <Tabs.Panel key={id} value={id} className="tool-panel" keepMounted={id === 'schema-registry' && registryVisited}><Tool {...(id === 'schema-registry' ? { active: activeTool === id } : {})} /></Tabs.Panel>
+        <Tabs.Panel key={id} value={id} className="tool-panel" keepMounted={keptTools.includes(id) && visited.includes(id)}><Tool {...(keptTools.includes(id) ? { active: activeTool === id } : {})} /></Tabs.Panel>
       ))}
     </Tabs>
   );
