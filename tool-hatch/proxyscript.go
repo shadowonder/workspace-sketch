@@ -57,7 +57,7 @@ func compileProxyScript(src string, log func(level, message string)) (*goja.Prog
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), proxyValidateTimeout)
 	defer cancel()
-	_, stop, err := newProxyRuntime(ctx, program, nil, log)
+	_, stop, err := newProxyRuntime(ctx, program, nil, nil, log)
 	stop()
 	if err != nil {
 		return nil, err
@@ -66,23 +66,27 @@ func compileProxyScript(src string, log func(level, message string)) (*goja.Prog
 }
 
 type proxyRuntime struct {
-	rt     *goja.Runtime
-	ctx    context.Context
-	client *http.Client
-	active bool // http.request is only callable while onRequest runs
-	calls  int
+	rt      *goja.Runtime
+	ctx     context.Context
+	client  *http.Client
+	shared  *proxyContext // the running proxy's shared context; nil while validating
+	active  bool          // http.request and context are only callable while onRequest runs
+	loading bool          // a context.getOrLoad loader is running
+	calls   int
 }
 
 // newProxyRuntime runs the program's top level and returns onRequest. The returned
 // stop function must always be called to release the interrupt watcher.
 // log receives console output; nil disables console (it is then undefined).
-func newProxyRuntime(ctx context.Context, program *goja.Program, client *http.Client, log func(level, message string)) (*proxyRuntime, func() bool, error) {
-	p := &proxyRuntime{rt: goja.New(), ctx: ctx, client: client}
+// shared is the running proxy's context (nil in the Start validation runtime).
+func newProxyRuntime(ctx context.Context, program *goja.Program, client *http.Client, shared *proxyContext, log func(level, message string)) (*proxyRuntime, func() bool, error) {
+	p := &proxyRuntime{rt: goja.New(), ctx: ctx, client: client, shared: shared}
 	p.rt.SetMaxCallStackSize(512)
 	stop := context.AfterFunc(ctx, func() { p.rt.Interrupt(ctx.Err()) })
 	httpObject := p.rt.NewObject()
 	_ = httpObject.Set("request", p.request)
 	_ = p.rt.Set("http", httpObject)
+	p.installContext()
 	if log != nil {
 		installConsole(p.rt, log)
 	}
@@ -98,10 +102,10 @@ func newProxyRuntime(ctx context.Context, program *goja.Program, client *http.Cl
 // runProxyScript applies onRequest to out. Unread bodies keep streaming from the
 // client; a body that the script reads is buffered (bounded) and re-sent with a
 // correct Content-Length, modified or not.
-func runProxyScript(parent context.Context, program *goja.Program, client *http.Client, log func(level, message string), out *http.Request) error {
+func runProxyScript(parent context.Context, program *goja.Program, client *http.Client, shared *proxyContext, log func(level, message string), out *http.Request) error {
 	ctx, cancel := context.WithTimeout(parent, proxyScriptTimeout)
 	defer cancel()
-	p, stop, err := newProxyRuntime(ctx, program, client, log)
+	p, stop, err := newProxyRuntime(ctx, program, client, shared, log)
 	defer stop()
 	if err != nil {
 		return &scriptFailure{http.StatusInternalServerError, err.Error()}

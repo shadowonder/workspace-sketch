@@ -15,11 +15,20 @@ export const defaultScript = `// onRequest runs before each request is forwarded
 // http.request({ url, method, headers, body, timeoutMs })
 //   -> { status, statusText, headers, body, header(name), json() }
 // console.log/info/warn/error/debug(...) -> Console panel (memory only; avoid printing secrets)
+// context: string cache shared by all requests of this running proxy (emptied on Stop/Start)
+//   context.get(key) -> string or null; context.set(key, value, ttlSeconds?); context.delete(key)
+//   context.getOrLoad(key, () => ({ value, ttlSeconds })) -> runs the loader once per key, even concurrently
 // Throwing an error rejects the request with HTTP 500 instead of forwarding it.
 function onRequest(req) {
-  // Example: obtain a token and attach it.
-  // const r = http.request({ method: 'POST', url: 'https://sso.example.com/token', body: { client: 'cli' } });
-  // req.setHeader('Authorization', 'Bearer ' + r.json().access_token);
+  // Example: obtain a token once, reuse it until shortly before it expires, and attach it.
+  // const token = context.getOrLoad('token', () => {
+  //   const started = Date.now();
+  //   const r = http.request({ method: 'POST', url: 'https://sso.example.com/token', body: { client: 'cli' } });
+  //   if (r.status !== 200) throw new Error('token request failed: ' + r.status); // failures are not cached
+  //   const data = r.json(), elapsed = (Date.now() - started) / 1000;
+  //   return { value: data.access_token, ttlSeconds: Math.max(1, data.expires_in - elapsed - 60) };
+  // });
+  // req.setHeader('Authorization', 'Bearer ' + token);
 }
 `;
 const defaults = { listenPort: '8080', targetURL: '', sourcePath: '', targetPath: '', script: defaultScript };

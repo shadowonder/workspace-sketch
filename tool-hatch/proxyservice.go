@@ -64,6 +64,7 @@ type ProxyService struct {
 
 	mu        sync.Mutex // guards the fields below
 	server    *http.Server
+	shared    *proxyContext // the running proxy's script context; new on every Start
 	cancel    context.CancelFunc
 	done      chan struct{}
 	address   string
@@ -179,15 +180,16 @@ func (s *ProxyService) Start(config ProxyConfig) ProxyStatus {
 		return s.statusWith(false, message)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	shared := newProxyContext()
 	server := &http.Server{
-		Handler:           newProxyHandler(route, program, s.record, s.console.add),
+		Handler:           newProxyHandler(route, program, shared, s.record, s.console.add),
 		ReadHeaderTimeout: 15 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ErrorLog:          log.New(io.Discard, "", 0), // never log request data
 	}
 	done := make(chan struct{})
 	s.mu.Lock()
-	s.server, s.cancel, s.done = server, cancel, done
+	s.server, s.shared, s.cancel, s.done = server, shared, cancel, done
 	s.address, s.target = "http://"+address, route.target.String()
 	s.lastError, s.requests, s.failures, s.activity = "", 0, 0, nil
 	s.mu.Unlock()
@@ -195,8 +197,9 @@ func (s *ProxyService) Start(config ProxyConfig) ProxyStatus {
 		err := server.Serve(listener)
 		s.mu.Lock()
 		if s.server == server { // exited without Stop
-			s.server = nil
+			s.server, s.shared = nil, nil
 			cancel()
+			shared.close()
 			if !errors.Is(err, http.ErrServerClosed) {
 				s.lastError = "Proxy server stopped unexpectedly."
 			}
@@ -212,13 +215,14 @@ func (s *ProxyService) Stop() ProxyStatus {
 	s.lifecycle.Lock()
 	defer s.lifecycle.Unlock()
 	s.mu.Lock()
-	server, cancel, done := s.server, s.cancel, s.done
-	s.server = nil
+	server, shared, cancel, done := s.server, s.shared, s.cancel, s.done
+	s.server, s.shared = nil, nil
 	s.mu.Unlock()
 	if server == nil {
 		return s.statusWith(true, "Proxy is stopped.")
 	}
-	cancel()
+	cancel()       // aborts scripts, waiters and streams
+	shared.close() // discards cached values; a later Start gets an empty context
 	ctx, timeout := context.WithTimeout(context.Background(), 3*time.Second)
 	defer timeout()
 	if server.Shutdown(ctx) != nil {
@@ -273,6 +277,7 @@ func (s *ProxyService) record(entry ProxyActivity) {
 type proxyHandler struct {
 	route   proxyRoute
 	program *goja.Program
+	shared  *proxyContext
 	client  *http.Client // script http.request calls; redirects are returned, not followed
 	proxy   *httputil.ReverseProxy
 	record  func(ProxyActivity)
@@ -281,9 +286,9 @@ type proxyHandler struct {
 
 type proxyErrorKey struct{}
 
-func newProxyHandler(route proxyRoute, program *goja.Program, record func(ProxyActivity), logConsole func(level, message string)) *proxyHandler {
+func newProxyHandler(route proxyRoute, program *goja.Program, shared *proxyContext, record func(ProxyActivity), logConsole func(level, message string)) *proxyHandler {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	h := &proxyHandler{route: route, program: program, record: record, log: logConsole,
+	h := &proxyHandler{route: route, program: program, shared: shared, record: record, log: logConsole,
 		client: &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone(),
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	h.proxy = &httputil.ReverseProxy{
@@ -334,7 +339,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	if h.program != nil {
-		if err := runProxyScript(out.Context(), h.program, h.client, h.log, out); err != nil {
+		if err := runProxyScript(out.Context(), h.program, h.client, h.shared, h.log, out); err != nil {
 			failure := &scriptFailure{http.StatusInternalServerError, err.Error()}
 			errors.As(err, &failure)
 			entry.Error = failure.message
