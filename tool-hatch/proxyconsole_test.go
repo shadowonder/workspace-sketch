@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func proxyGet(t *testing.T, url string) int {
@@ -109,27 +111,112 @@ func TestProxyConsoleIsIndependentOfActivityAndLifecycle(t *testing.T) {
 
 func TestProxyConsoleBufferBounds(t *testing.T) {
 	var c proxyConsole
-	for i := 1; i <= proxyConsoleLimit+5; i++ {
+	for i := 1; i <= proxyConsoleDefaultLimit+5; i++ {
 		c.add("log", fmt.Sprint(i))
 	}
 	all := c.since(0)
-	if len(all.Entries) != proxyConsoleLimit || all.Entries[0].Message != "6" || !all.Truncated || all.LastID != proxyConsoleLimit+5 {
+	if len(all.Entries) != proxyConsoleDefaultLimit || all.Entries[0].Message != "6" || !all.Truncated || all.LastID != proxyConsoleDefaultLimit+5 || all.Limit != proxyConsoleDefaultLimit {
 		t.Fatalf("ring: first=%+v len=%d truncated=%v", all.Entries[0], len(all.Entries), all.Truncated)
 	}
-	if recent := c.since(int64(proxyConsoleLimit)); len(recent.Entries) != 5 || recent.Truncated {
+	if recent := c.since(int64(proxyConsoleDefaultLimit)); len(recent.Entries) != 5 || recent.Truncated {
 		t.Fatalf("incremental: %+v", recent)
 	}
 	if none := c.since(all.LastID); len(none.Entries) != 0 || none.Entries == nil {
 		t.Fatal("empty fetch must be an empty list")
 	}
-	c.clear()
-	c.add("log", strings.Repeat("é", proxyConsoleEntryLimit))
-	got := c.since(0)
-	if got.Truncated || len(got.Entries) != 1 || len(got.Entries[0].Message) > proxyConsoleEntryLimit+len("…") || !strings.HasSuffix(got.Entries[0].Message, "…") {
-		t.Fatalf("entry bound: truncated=%v len=%d", got.Truncated, len(got.Entries[0].Message))
+	// Entry-count choices: lowering evicts the oldest at once; invalid values are ignored.
+	if got := c.setLimit(100); got.Limit != 100 || len(c.since(0).Entries) != 100 || c.since(0).Entries[0].Message != "406" {
+		t.Fatalf("setLimit(100): %+v", got.Limit)
 	}
-	if !strings.HasPrefix(got.Entries[0].Message, "éé") || strings.ContainsRune(got.Entries[0].Message, '�') {
-		t.Fatal("multibyte truncation produced invalid UTF-8")
+	if got := c.setLimit(123); got.Limit != 100 {
+		t.Fatal("invalid limit accepted")
+	}
+	c.setLimit(proxyConsoleDefaultLimit)
+	c.clear()
+
+	// A message far beyond the old 4 KiB cap is retained in full; only the
+	// preview sent to the frontend is short (and cut on a UTF-8 boundary).
+	long := strings.Repeat("é", 300<<10) + "END"
+	c.add("log", long)
+	got := c.since(0)
+	entry := got.Entries[0]
+	if got.Truncated || len(got.Entries) != 1 || entry.Size != len(long) || !entry.PreviewTruncated || entry.Incomplete {
+		t.Fatalf("entry: %+v", entry)
+	}
+	if len(entry.Message) > proxyConsolePreviewLimit || !strings.HasPrefix(entry.Message, "éé") || !utf8.ValidString(entry.Message) {
+		t.Fatalf("preview: len=%d", len(entry.Message))
+	}
+	if full, incomplete, ok := c.full(entry.ID); !ok || incomplete || full != long {
+		t.Fatal("full message not retained")
+	}
+	if short := (&proxyConsole{}); true {
+		short.add("info", "small")
+		if e := short.since(0).Entries[0]; e.PreviewTruncated || e.Message != "small" || e.Size != 5 {
+			t.Fatalf("short entry: %+v", e)
+		}
+	}
+}
+
+// The aggregate byte budget evicts the oldest messages; a single message larger
+// than the budget is kept cut and explicitly marked incomplete.
+func TestProxyConsoleMemoryBudget(t *testing.T) {
+	old := proxyConsoleBudget
+	proxyConsoleBudget = 1 << 20
+	defer func() { proxyConsoleBudget = old }()
+	var c proxyConsole
+	chunk := strings.Repeat("a", 300<<10)
+	for i := 0; i < 5; i++ {
+		c.add("log", fmt.Sprint(i)+chunk)
+	}
+	got := c.since(0)
+	total := 0
+	for _, e := range got.Entries {
+		total += e.Size
+	}
+	if len(got.Entries) != 3 || got.Entries[0].Message[:1] != "2" || total > proxyConsoleBudget || !got.Truncated {
+		t.Fatalf("budget eviction: %d entries, %d bytes", len(got.Entries), total)
+	}
+	c.add("error", strings.Repeat("b", 2<<20))
+	got = c.since(0)
+	last := got.Entries[len(got.Entries)-1]
+	if len(got.Entries) != 1 || !last.Incomplete || last.Size != proxyConsoleBudget {
+		t.Fatalf("oversized entry: %d entries, %+v", len(got.Entries), last.Size)
+	}
+	if full, incomplete, ok := c.full(last.ID); !ok || !incomplete || len(full) != proxyConsoleBudget {
+		t.Fatal("oversized entry must be retained cut and marked incomplete")
+	}
+	if _, _, ok := c.full(1); ok {
+		t.Fatal("evicted entry still retrievable")
+	}
+}
+
+// CopyConsole copies the complete message through the Go clipboard by ID,
+// while Console() only ever carries the preview.
+func TestProxyConsoleCopyFull(t *testing.T) {
+	var clipboard []string
+	s := &ProxyService{clipboard: func(text string) bool { clipboard = append(clipboard, text); return true }}
+	long := strings.Repeat("0123456789", 10<<10) // 100 KiB
+	s.console.add("log", long)
+	response := s.Console(0)
+	raw, _ := json.Marshal(response)
+	if len(raw) > 4*proxyConsolePreviewLimit || strings.Contains(string(raw), long) {
+		t.Fatalf("Console response carries the full message (%d bytes)", len(raw))
+	}
+	copied := s.CopyConsole(response.Entries[0].ID)
+	if !copied.Success || !copied.Complete || copied.Bytes != int64(len(long)) || len(clipboard) != 1 || clipboard[0] != long {
+		t.Fatalf("copy: %+v", copied)
+	}
+	if missing := s.CopyConsole(999); missing.Success || len(clipboard) != 1 {
+		t.Fatal("copy of a missing entry must fail without touching the clipboard")
+	}
+	s.ClearConsole()
+	if again := s.CopyConsole(response.Entries[0].ID); again.Success {
+		t.Fatal("cleared entry still copyable")
+	}
+	s.clipboard = func(string) bool { return false }
+	s.console.add("log", "x")
+	if failed := s.CopyConsole(s.Console(0).Entries[0].ID); failed.Success || !strings.Contains(failed.Message, "clipboard") {
+		t.Fatal("clipboard failure not reported")
 	}
 }
 
@@ -170,7 +257,7 @@ func TestProxyConsoleConcurrentRequestsAndTimeout(t *testing.T) {
 		t.Fatalf("console loop escaped the time limit: %d", status)
 	}
 	// Eviction itself is covered by TestProxyConsoleBufferBounds; here only the bounds.
-	if got := loud.Console(0); len(got.Entries) == 0 || len(got.Entries) > proxyConsoleLimit || len(got.Entries[0].Message) > proxyConsoleEntryLimit+len("…") {
+	if got := loud.Console(0); len(got.Entries) == 0 || len(got.Entries) > proxyConsoleDefaultLimit || len(got.Entries[0].Message) > proxyConsolePreviewLimit {
 		t.Fatalf("buffer not bounded: %d", len(got.Entries))
 	}
 }

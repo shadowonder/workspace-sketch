@@ -312,7 +312,7 @@ func TestProxyContextInvalidInput(t *testing.T) {
 	}
 
 	// context, like http.request, is unavailable in top-level code.
-	if _, err := compileProxyScript(`context.set('k', 'v'); function onRequest(req) {}`, nil); err == nil || !strings.Contains(err.Error(), "context.set: only available while onRequest runs") {
+	if _, err := compileProxyScript(`context.set('k', 'v'); function onRequest(req) {}`, nil); err == nil || !strings.Contains(err.Error(), "context.set: only available while onRequest or onResponse runs") {
 		t.Fatalf("top-level use: %v", err)
 	}
 }

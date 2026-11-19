@@ -8,7 +8,8 @@ vi.mock('../bindings/github.com/shadowonder/fast-chrome-plugin/tool-hatch', () =
   StringService: { Process: vi.fn().mockResolvedValue({ result: '', metadata: { success: true, operation: 'avro-to-plain', message: 'Done' } }) },
   RegistryService: { Fetch: vi.fn(), Schema: vi.fn() },
   ProfileService: { List: vi.fn(), Apply: vi.fn(), Save: vi.fn(), Delete: vi.fn(), SaveDefault: vi.fn() },
-  ProxyService: { ListConfigs: vi.fn(), SaveDraft: vi.fn(), SaveConfig: vi.fn(), DeleteConfig: vi.fn(), Start: vi.fn(), Stop: vi.fn(), Status: vi.fn(), Console: vi.fn(), ClearConsole: vi.fn() },
+  ProxyService: { ListConfigs: vi.fn(), SaveDraft: vi.fn(), SaveConfig: vi.fn(), DeleteConfig: vi.fn(), Start: vi.fn(), Stop: vi.fn(), Status: vi.fn(), Console: vi.fn(), ClearConsole: vi.fn(),
+    SetDebug: vi.fn(), SetActivityLimit: vi.fn(), ClearActivity: vi.fn(), Capture: vi.fn(), CopyCapture: vi.fn(), CopyConsole: vi.fn(), SetConsoleLimit: vi.fn() },
 }));
 vi.mock('@wailsio/runtime', () => ({ Clipboard: { SetText: vi.fn() } }));
 Object.defineProperty(window, 'matchMedia', { writable: true, value: vi.fn().mockImplementation(() => ({ matches: false, addEventListener() {}, removeEventListener() {} })) });
@@ -20,7 +21,7 @@ const stopped = { success: true, message: '', running: false, address: '', targe
 const tab = (name) => [...container.querySelectorAll('[role="tab"]')].find((e) => e.textContent === name);
 const field = (name) => container.querySelector(`input[aria-label="${name}"]`);
 const button = (name) => [...container.querySelectorAll('button')].find((e) => e.textContent.trim() === name);
-const script = () => container.querySelector('#onrequest-script-editor');
+const script = () => container.querySelector('#proxy-script-editor');
 const serverState = () => container.querySelector('[aria-label="Proxy server state"]').textContent;
 const statusText = () => container.querySelector('.proxy-status').textContent;
 const flush = () => act(async () => { await Promise.resolve(); await Promise.resolve(); });
@@ -203,7 +204,7 @@ it('places a collapsed Console below Activity and fetches entries only when the 
   consoleBackend(entries);
   await openProxy();
   const side = container.querySelector('.proxy-side');
-  expect([...side.children].map((e) => e.getAttribute('aria-label'))).toEqual(['Request activity', 'Script console']);
+  expect([...side.children].map((e) => e.getAttribute('aria-label'))).toEqual(['Request activity', 'Request inspector', 'Script console']);
   expect(consoleButton().getAttribute('aria-expanded')).toBe('false');
   expect(container.querySelector('#proxy-console-output')).toBeNull();
   expect(ProxyService.Console).not.toHaveBeenCalled(); // cursor 0: nothing to fetch
@@ -270,4 +271,194 @@ it('reports discarded console entries', async () => {
   await click(consoleButton());
   expect(container.querySelector('#proxy-console-output').textContent).toContain('Older entries were discarded');
   expect(consoleLines()).toEqual(['10:20:39.129logtail']);
+});
+
+const findInput = () => container.querySelector('input[aria-label="Find in Proxy Script"]');
+const findCount = () => container.querySelector('.editor-find-count').textContent;
+const findModifier = () => (/Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || '') ? { metaKey: true } : { ctrlKey: true });
+async function key(element, init) {
+  let event;
+  await act(async () => { event = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init }); element.dispatchEvent(event); });
+  return event;
+}
+
+it('finds literal text in the Proxy Script with Cmd/Ctrl+F, Enter/Shift+Enter wrapping and Escape', async () => {
+  await openProxy();
+  const text = 'abc foo\nFoo bar\nfoo end';
+  await edit(script(), text);
+  const saves = ProxyService.SaveDraft.mock.calls.length;
+  expect(container.querySelector('label[for="proxy-script-editor"]').textContent).toBe('Proxy Script');
+  script().focus(); script().setSelectionRange(0, 0);
+
+  // Shortcuts outside the editor are not intercepted.
+  const outside = await key(field('Target URL'), { key: 'f', ...findModifier() });
+  expect(outside.defaultPrevented).toBe(false);
+  expect(findInput()).toBeNull();
+
+  const opened = await key(script(), { key: 'f', ...findModifier() });
+  expect(opened.defaultPrevented).toBe(true);
+  expect(document.activeElement).toBe(findInput());
+  await edit(findInput(), 'foo');
+  expect(findCount()).toBe('1/3');
+  expect([script().selectionStart, script().selectionEnd]).toEqual([4, 7]);
+  await key(findInput(), { key: 'Enter' });
+  expect(findCount()).toBe('2/3'); expect(script().selectionStart).toBe(8);
+  await key(findInput(), { key: 'Enter' });
+  expect(findCount()).toBe('3/3'); expect(script().selectionStart).toBe(16);
+  await key(findInput(), { key: 'Enter' });
+  expect(findCount()).toBe('1/3'); expect(script().selectionStart).toBe(4); // wrapped to the first
+  await key(findInput(), { key: 'Enter', shiftKey: true });
+  expect(findCount()).toBe('3/3'); expect(script().selectionStart).toBe(16); // wrapped to the last
+  expect(document.activeElement).toBe(findInput());
+  await key(findInput(), { key: 'Enter', isComposing: true }); // IME composition is left alone
+  expect(findCount()).toBe('3/3');
+
+  await edit(findInput(), 'zzz');
+  expect(findCount()).toBe('No results');
+  await key(findInput(), { key: 'Enter' });
+  expect(script().selectionStart).toBe(16);
+
+  await edit(findInput(), 'bar');
+  await key(findInput(), { key: 'Escape' });
+  expect(findInput()).toBeNull();
+  expect(document.activeElement).toBe(script());
+  expect([script().selectionStart, script().selectionEnd]).toEqual([12, 15]);
+  expect(script().value).toBe(text);
+  expect(ProxyService.SaveDraft.mock.calls.length).toBe(saves); // searching never edits the draft
+
+  // Reopening prefills the current single-line selection.
+  await key(script(), { key: 'f', ...findModifier() });
+  expect(findInput().value).toBe('bar'); expect(findCount()).toBe('1/1');
+
+  // Other uses of the shared Editor do not intercept the shortcut.
+  await click(tab('String'));
+  const elsewhere = await key(container.querySelector('#input-editor'), { key: 'f', ...findModifier() });
+  expect(elsewhere.defaultPrevented).toBe(false);
+  expect(container.querySelector('input[aria-label^="Find in"]:not([aria-label="Find in Proxy Script"])')).toBeNull();
+});
+
+const activityEntry = (id, patch = {}) => ({ id, time: '2026-11-17T10:00:00-06:00', method: 'POST', path: `/v1/r${id}`, status: 200, durationMs: 5, error: '', pending: false, debug: false, ...patch });
+const part = (preview, patch = {}) => ({ preview, truncated: false, size: preview.length, observed: preview.length, state: 'complete', binary: false, note: '', ...patch });
+function captureView(id, body) {
+  return { success: true, message: '', entry: activityEntry(id), state: 'complete', note: '',
+    request: { line: `POST /v1/r${id}`, headers: part('Authorization: •••• (20 characters hidden; Copy includes it)'), body: part(body, { truncated: true, size: 1 << 20 }) },
+    response: { line: '200 OK', headers: part('Content-Type: application/json'), body: part('{"ok":true}') } };
+}
+const rows = () => [...container.querySelectorAll('.activity-entry')];
+
+it('toggles Debug through Go and inspects only selected DEBUG entries with Copy via Go', async () => {
+  goState = { ...stopped, running: true, address: 'http://127.0.0.1:8080', target: 't', requests: 2, debug: false, debugBytes: 2048, debugLimitBytes: 200 << 20, activityLimit: 200,
+    activity: [activityEntry(1), activityEntry(2, { debug: true, pending: true, status: 0 }), activityEntry(3, { debug: true })] };
+  ProxyService.SetDebug.mockImplementation(async (enabled) => { goState = { ...goState, debug: enabled }; return { ...goState, message: 'ok' }; });
+  ProxyService.SetActivityLimit.mockImplementation(async (limit) => { goState = { ...goState, activityLimit: limit }; return { ...goState }; });
+  ProxyService.ClearActivity.mockImplementation(async () => { goState = { ...goState, activity: [], debugBytes: 0 }; return { ...goState }; });
+  ProxyService.CopyCapture.mockResolvedValue({ success: true, message: 'Copied 1.0 MiB.', bytes: 1 << 20, base64: false, complete: true });
+  const pendingCaptures = {};
+  ProxyService.Capture.mockImplementation((id) => new Promise((resolve) => { pendingCaptures[id] = () => resolve(captureView(id, `body-${id}`)); }));
+  await openProxy();
+
+  const debugSwitch = container.querySelector('input[aria-label="Debug capture"]');
+  expect(debugSwitch.checked).toBe(false);
+  await click(debugSwitch); await flush();
+  expect(ProxyService.SetDebug).toHaveBeenCalledWith(true);
+  expect(container.querySelector('input[aria-label="Debug capture"]').checked).toBe(true);
+
+  // Newest first: #3, #2 (pending, DEBUG), #1 (not captured, not selectable).
+  expect(rows().map((row) => row.getAttribute('role'))).toEqual(['button', 'button', null]);
+  expect(rows()[1].textContent).toContain('…'); expect(rows()[1].textContent).toContain('open');
+  expect(rows()[0].textContent).toContain('DEBUG'); expect(rows()[2].textContent).not.toContain('DEBUG');
+  const inspector = () => container.querySelector('.proxy-inspector');
+  expect(inspector().getAttribute('data-open')).toBe('false');
+  await click(rows()[2]);
+  expect(ProxyService.Capture).not.toHaveBeenCalled();
+  expect(inspector().getAttribute('data-open')).toBe('false');
+
+  // Selecting #2 then #3: the late answer for #2 must not replace #3's view.
+  await click(rows()[1]);
+  expect(inspector().getAttribute('data-open')).toBe('true');
+  expect(ProxyService.Capture).toHaveBeenLastCalledWith(2);
+  await click(rows()[0]);
+  expect(ProxyService.Capture).toHaveBeenLastCalledWith(3);
+  await act(async () => pendingCaptures[3]());
+  await act(async () => pendingCaptures[2]());
+  expect(inspector().textContent).toContain('body-3'); expect(inspector().textContent).not.toContain('body-2');
+  expect(inspector().textContent).toContain('#3 POST /v1/r3');
+  expect(inspector().textContent).toContain('Preview shows the first 6 B; Copy copies all 1.0 MiB.');
+  expect(inspector().textContent).toContain('•••• (20 characters hidden');
+  expect(rows()[0].getAttribute('aria-pressed')).toBe('true');
+
+  await click(container.querySelector('button[aria-label="Copy Request body"]')); await flush();
+  expect(ProxyService.CopyCapture).toHaveBeenCalledWith(3, 'requestBody');
+  expect(inspector().textContent).toContain('Copied 1.0 MiB.');
+
+  const select = container.querySelector('select[aria-label="Activity retention"]');
+  expect(select.value).toBe('200');
+  await act(async () => { select.value = '500'; select.dispatchEvent(new Event('change', { bubbles: true })); }); await flush();
+  expect(ProxyService.SetActivityLimit).toHaveBeenCalledWith(500);
+
+  await click(container.querySelector('button[aria-label="Clear activity"]')); await flush();
+  expect(ProxyService.ClearActivity).toHaveBeenCalledTimes(1);
+  expect(rows()).toHaveLength(0);
+  expect(inspector().textContent).toContain('This entry is no longer retained.');
+  expect(ProxyService.Stop).not.toHaveBeenCalled();
+});
+
+it('refreshes a selected pending capture on existing polls even when allocated memory is unchanged', async () => {
+  vi.useFakeTimers();
+  goState = { ...stopped, running: true, debugBytes: 65536,
+    activity: [activityEntry(1, { debug: true, pending: true, status: 0 })] };
+  let body = 'first event';
+  ProxyService.Capture.mockImplementation(async () => captureView(1, body));
+  await openProxy();
+  await click(rows()[0]);
+  const inspector = () => container.querySelector('.proxy-inspector');
+  expect(inspector().textContent).toContain('first event');
+  body = 'first event; second event';
+  const polls = ProxyService.Status.mock.calls.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+  expect(ProxyService.Status.mock.calls.length).toBe(polls + 1);
+  expect(inspector().textContent).toContain('first event; second event');
+
+  // Collapsed and hidden inspectors must not add capture fetches.
+  await click(container.querySelector('[aria-controls="proxy-inspector-body"]'));
+  const collapsedCalls = ProxyService.Capture.mock.calls.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  expect(ProxyService.Capture).toHaveBeenCalledTimes(collapsedCalls);
+  await click(tab('String'));
+  const hiddenCalls = ProxyService.Status.mock.calls.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  expect(ProxyService.Status).toHaveBeenCalledTimes(hiddenCalls);
+
+  await click(tab('Dynamic Proxy'));
+  await click(container.querySelector('[aria-controls="proxy-inspector-body"]'));
+  const openCalls = ProxyService.Capture.mock.calls.length;
+  await click(tab('String'));
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  expect(ProxyService.Capture).toHaveBeenCalledTimes(openCalls);
+  await click(tab('Dynamic Proxy'));
+  goState = { ...goState, activity: [activityEntry(1, { debug: true })] };
+  await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+  const completedCalls = ProxyService.Capture.mock.calls.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  expect(ProxyService.Capture).toHaveBeenCalledTimes(completedCalls);
+});
+
+it('shows Console previews and copies full messages by entry ID through Go', async () => {
+  const long = { ...logEntry(1, 'log', 'x'.repeat(2048)), size: 100000, previewTruncated: true, incomplete: false };
+  consoleBackend([long, logEntry(2, 'info', 'short')]);
+  ProxyService.CopyConsole.mockResolvedValue({ success: true, message: 'Copied 97.7 KiB.', bytes: 100000, base64: false, complete: true });
+  ProxyService.SetConsoleLimit.mockResolvedValue({ entries: [], lastID: 2, truncated: false, limit: 100 });
+  goState = { ...goState, consoleLastID: 2, consoleLimit: 500 };
+  await openProxy();
+  await click(consoleButton());
+  const entries = [...container.querySelectorAll('.console-entry')];
+  expect(entries[0].textContent).toContain('preview of 97.7 KiB');
+  expect(entries[1].textContent).not.toContain('preview of');
+  await click(container.querySelector('button[aria-label="Copy console entry 1"]')); await flush();
+  expect(ProxyService.CopyConsole).toHaveBeenCalledWith(1);
+  expect(container.querySelector('.proxy-console').textContent).toContain('Copied 97.7 KiB.');
+  const select = container.querySelector('select[aria-label="Console retention"]');
+  expect(select.value).toBe('500');
+  await act(async () => { select.value = '100'; select.dispatchEvent(new Event('change', { bubbles: true })); }); await flush();
+  expect(ProxyService.SetConsoleLimit).toHaveBeenCalledWith(100);
 });

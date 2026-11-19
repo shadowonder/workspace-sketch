@@ -261,7 +261,7 @@ func (c *proxyContext) storeLocked(key, value string, ttl time.Duration) error {
 }
 
 // installContext defines the global context object. Like http.request it works
-// only while onRequest runs; the Start validation runtime has no context.
+// only while onRequest or onResponse runs; the Start validation runtime has no context.
 func (p *proxyRuntime) installContext() {
 	rt := p.rt
 	fail := func(err error) {
@@ -283,7 +283,7 @@ func (p *proxyRuntime) installContext() {
 	}
 	shared := func(method string) *proxyContext {
 		if !p.active || p.shared == nil {
-			panic(rt.NewGoError(errors.New("context." + method + ": only available while onRequest runs")))
+			panic(rt.NewGoError(errors.New("context." + method + ": " + proxyHookOnly)))
 		}
 		return p.shared
 	}

@@ -116,11 +116,12 @@ func TestCompileProxyScriptValidation(t *testing.T) {
 		t.Fatal("empty script must mean plain forwarding")
 	}
 	for script, want := range map[string]string{
-		"function onRequest(req) {": "syntax error",
-		"var x = 1;":                "must define function onRequest",
-		"var onRequest = 3;":        "must define function onRequest",
+		"function onRequest(req) {":                                        "syntax error",
+		"var onRequest = 3;":                                               "onRequest must be a function",
+		"var onResponse = {}; function onRequest(){}":                      "onResponse must be a function",
+		"var onRequest = null;":                                            "onRequest must be a function",
 		"throw new Error('boom'); function onRequest(){}":                  "boom",
-		"http.request({url:'http://127.0.0.1:1'}); function onRequest(){}": "only available while onRequest runs",
+		"http.request({url:'http://127.0.0.1:1'}); function onRequest(){}": "only available while onRequest or onResponse runs",
 		"while (true) {} function onRequest(){}":                           "time limit",
 	} {
 		if _, err := compileProxyScript(script, nil); err == nil || !strings.Contains(err.Error(), want) {
@@ -390,7 +391,7 @@ func TestProxyLifecycle(t *testing.T) {
 	if status := s.Start(ProxyConfig{ListenPort: port, TargetURL: "nope"}); status.Success || status.Running {
 		t.Fatal("invalid config started")
 	}
-	if status := s.Start(ProxyConfig{ListenPort: port, TargetURL: upstream.URL, Script: "function x() {}"}); status.Success || status.Running || !strings.Contains(status.Message, "onRequest") {
+	if status := s.Start(ProxyConfig{ListenPort: port, TargetURL: upstream.URL, Script: "var onResponse = 1;"}); status.Success || status.Running || !strings.Contains(status.Message, "onResponse must be a function") {
 		t.Fatal("invalid script started")
 	}
 	status := s.Start(ProxyConfig{ListenPort: port, TargetURL: upstream.URL})

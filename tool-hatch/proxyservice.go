@@ -19,8 +19,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/dop251/goja"
 )
 
 // ProxyConfig is a complete proxy definition. The proxy always listens on
@@ -34,6 +32,9 @@ type ProxyConfig struct {
 }
 
 // ProxyActivity records metadata only: never query strings, headers or bodies.
+// A pending entry is still being forwarded (for example an open SSE stream).
+// Debug marks entries whose exchange was captured; the capture itself stays in
+// Go and is fetched only through Capture/CopyCapture.
 type ProxyActivity struct {
 	ID         int64  `json:"id"`
 	Time       string `json:"time"`
@@ -42,6 +43,13 @@ type ProxyActivity struct {
 	Status     int    `json:"status"`
 	DurationMs int64  `json:"durationMs"`
 	Error      string `json:"error"`
+	Pending    bool   `json:"pending"`
+	Debug      bool   `json:"debug"`
+}
+
+type activityRecord struct {
+	ProxyActivity
+	capture *proxyCapture // nil unless Debug was on when the request started
 }
 
 // ProxyStatus reports the actual Go server state plus recent activity.
@@ -57,6 +65,12 @@ type ProxyStatus struct {
 	Activity  []ProxyActivity `json:"activity"`
 	// ConsoleLastID lets the UI fetch console entries only when new ones exist.
 	ConsoleLastID int64 `json:"consoleLastID"`
+	ConsoleLimit  int   `json:"consoleLimit"`
+	// Debug is the current switch state (sampled by each request when it starts).
+	Debug           bool  `json:"debug"`
+	DebugBytes      int64 `json:"debugBytes"`
+	DebugLimitBytes int64 `json:"debugLimitBytes"`
+	ActivityLimit   int   `json:"activityLimit"`
 }
 
 type ProxyService struct {
@@ -73,7 +87,16 @@ type ProxyService struct {
 	nextID    int64
 	requests  int64
 	failures  int64
-	activity  []ProxyActivity
+	records   []*activityRecord
+	// run identifies the current server run and epoch the current Activity
+	// storage (bumped by Start, Stop, unexpected exit and ClearActivity), so late
+	// handlers of an earlier run or of cleared storage cannot repopulate it.
+	run, epoch    int64
+	debug         bool  // Debug switch; memory-only, off after app restart
+	debugBytes    int64 // memory charged by retained captures
+	activityLimit int
+
+	clipboard func(string) bool // tests; nil uses the Wails clipboard
 
 	storeMu   sync.Mutex
 	storePath string
@@ -82,7 +105,10 @@ type ProxyService struct {
 	console proxyConsole
 }
 
-const proxyActivityLimit = 100
+// Activity retention choices; captures are released with their entries.
+var proxyActivityLimits = []int{100, 200, 500}
+
+const proxyActivityDefault = 200
 
 func NewProxyService() *ProxyService {
 	path := ""
@@ -161,7 +187,7 @@ func (s *ProxyService) Start(config ProxyConfig) ProxyStatus {
 	if err != nil {
 		return s.statusWith(false, err.Error())
 	}
-	program, err := compileProxyScript(config.Script, s.console.add)
+	script, err := compileProxyScript(config.Script, s.console.add)
 	if err != nil {
 		return s.statusWith(false, err.Error())
 	}
@@ -181,8 +207,15 @@ func (s *ProxyService) Start(config ProxyConfig) ProxyStatus {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	shared := newProxyContext()
+	s.mu.Lock()
+	s.run++
+	s.epoch++
+	run := s.run
+	s.releaseAllLocked("Released when the proxy restarted.")
+	s.records = nil
+	s.mu.Unlock()
 	server := &http.Server{
-		Handler:           newProxyHandler(route, program, shared, s.record, s.console.add),
+		Handler:           newProxyHandler(route, script, shared, s, run, s.console.add),
 		ReadHeaderTimeout: 15 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ErrorLog:          log.New(io.Discard, "", 0), // never log request data
@@ -191,7 +224,7 @@ func (s *ProxyService) Start(config ProxyConfig) ProxyStatus {
 	s.mu.Lock()
 	s.server, s.shared, s.cancel, s.done = server, shared, cancel, done
 	s.address, s.target = "http://"+address, route.target.String()
-	s.lastError, s.requests, s.failures, s.activity = "", 0, 0, nil
+	s.lastError, s.requests, s.failures = "", 0, 0
 	s.mu.Unlock()
 	go func() {
 		err := server.Serve(listener)
@@ -200,6 +233,8 @@ func (s *ProxyService) Start(config ProxyConfig) ProxyStatus {
 			s.server, s.shared = nil, nil
 			cancel()
 			shared.close()
+			s.epoch++
+			s.releaseAllLocked("Released when the proxy stopped.")
 			if !errors.Is(err, http.ErrServerClosed) {
 				s.lastError = "Proxy server stopped unexpectedly."
 			}
@@ -217,6 +252,11 @@ func (s *ProxyService) Stop() ProxyStatus {
 	s.mu.Lock()
 	server, shared, cancel, done := s.server, s.shared, s.cancel, s.done
 	s.server, s.shared = nil, nil
+	if server != nil {
+		// Debug payloads are released now; late writes see the released mark.
+		s.epoch++
+		s.releaseAllLocked("Released when the proxy stopped.")
+	}
 	s.mu.Unlock()
 	if server == nil {
 		return s.statusWith(true, "Proxy is stopped.")
@@ -234,11 +274,72 @@ func (s *ProxyService) Stop() ProxyStatus {
 
 func (s *ProxyService) Status() ProxyStatus { return s.statusWith(true, "") }
 
+// SetDebug switches capture for requests that start afterwards. Captures already
+// retained stay until eviction, ClearActivity, Stop or quit. Not persisted.
+func (s *ProxyService) SetDebug(enabled bool) ProxyStatus {
+	s.mu.Lock()
+	s.debug = enabled
+	s.mu.Unlock()
+	if enabled {
+		return s.statusWith(true, "Debug capture on for new requests.")
+	}
+	return s.statusWith(true, "Debug capture off; retained captures are kept until cleared.")
+}
+
+// SetActivityLimit changes how many Activity entries (and their captures) are kept.
+func (s *ProxyService) SetActivityLimit(limit int) ProxyStatus {
+	valid := false
+	for _, n := range proxyActivityLimits {
+		valid = valid || n == limit
+	}
+	if !valid {
+		return s.statusWith(false, "Activity retention must be 100, 200 or 500 entries.")
+	}
+	s.mu.Lock()
+	s.activityLimit = limit
+	s.trimLocked()
+	s.mu.Unlock()
+	return s.statusWith(true, "")
+}
+
+// ClearActivity discards Activity entries and releases all Debug captures.
+// Counters keep describing the current run.
+func (s *ProxyService) ClearActivity() ProxyStatus {
+	s.mu.Lock()
+	s.epoch++
+	s.releaseAllLocked("Released by Clear.")
+	s.records = nil
+	s.mu.Unlock()
+	return s.statusWith(true, "Activity cleared.")
+}
+
 // Console returns script console entries with ID greater than afterID.
 func (s *ProxyService) Console(afterID int64) ProxyConsoleResponse { return s.console.since(afterID) }
 
 // ClearConsole discards buffered console entries; IDs keep increasing.
 func (s *ProxyService) ClearConsole() ProxyConsoleResponse { return s.console.clear() }
+
+// SetConsoleLimit changes how many console entries are retained (100/500/1000).
+func (s *ProxyService) SetConsoleLimit(limit int) ProxyConsoleResponse {
+	return s.console.setLimit(limit)
+}
+
+// CopyConsole copies one complete retained console message to the clipboard
+// from Go; the frontend only ever holds previews.
+func (s *ProxyService) CopyConsole(id int64) ProxyCopyResponse {
+	message, incomplete, ok := s.console.full(id)
+	if !ok {
+		return ProxyCopyResponse{Message: "This console entry is no longer retained."}
+	}
+	if !s.setClipboard(message) {
+		return ProxyCopyResponse{Message: "Could not write to the clipboard."}
+	}
+	text := "Copied " + formatSize(int64(len(message)))
+	if incomplete {
+		text += " — the message exceeded the per-entry limit and was cut when logged"
+	}
+	return ProxyCopyResponse{Success: true, Message: text + ".", Bytes: int64(len(message)), Complete: !incomplete}
+}
 
 func (s *ProxyService) isRunning() bool {
 	s.mu.Lock()
@@ -250,62 +351,162 @@ func (s *ProxyService) statusWith(success bool, message string) ProxyStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	status := ProxyStatus{Success: success, Message: message, Running: s.server != nil, Requests: s.requests,
-		Failures: s.failures, LastError: s.lastError, Activity: make([]ProxyActivity, len(s.activity))}
-	copy(status.Activity, s.activity)
-	status.ConsoleLastID = s.console.last()
+		Failures: s.failures, LastError: s.lastError, Activity: make([]ProxyActivity, len(s.records)),
+		Debug: s.debug, DebugBytes: s.debugBytes, DebugLimitBytes: proxyDebugBudget, ActivityLimit: s.limitLocked()}
+	for i, r := range s.records {
+		status.Activity[i] = r.ProxyActivity
+	}
+	status.ConsoleLastID, status.ConsoleLimit = s.console.state()
 	if status.Running {
 		status.Address, status.Target = s.address, s.target
 	}
 	return status
 }
 
-func (s *ProxyService) record(entry ProxyActivity) {
+func (s *ProxyService) limitLocked() int {
+	if s.activityLimit == 0 {
+		return proxyActivityDefault
+	}
+	return s.activityLimit
+}
+
+// trimLocked enforces the entry count, evicting the oldest completed entry first
+// (the oldest pending one only if all are pending) and releasing its capture.
+func (s *ProxyService) trimLocked() {
+	for len(s.records) > s.limitLocked() {
+		victim := 0
+		for i, r := range s.records {
+			if !r.Pending {
+				victim = i
+				break
+			}
+		}
+		s.releaseLocked(s.records[victim].capture, "Evicted from Activity.")
+		s.records = append(s.records[:victim], s.records[victim+1:]...)
+	}
+}
+
+// proxyTicket is sampled when a request arrives: Debug applies only to requests
+// that start while it is on, and only within the storage epoch they started in.
+type proxyTicket struct {
+	run, epoch int64
+	debug      bool
+}
+
+// proxyExchange links one forwarded request to its Activity record and capture.
+type proxyExchange struct {
+	id, run int64
+	capture *proxyCapture
+	err     string // proxy error shown in Activity; set by the ReverseProxy error handler
+}
+
+type proxyExchangeKey struct{}
+
+func exchangeOf(ctx context.Context) *proxyExchange {
+	ex, _ := ctx.Value(proxyExchangeKey{}).(*proxyExchange)
+	return ex
+}
+
+func (s *ProxyService) admit(run int64) proxyTicket {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return proxyTicket{run: run, epoch: s.epoch, debug: s.debug}
+}
+
+// begin inserts a pending Activity entry once the request is about to be
+// forwarded (or rejected); requests of an earlier run are not recorded.
+func (s *ProxyService) begin(t proxyTicket, entry ProxyActivity, capture bool) *proxyExchange {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ex := &proxyExchange{run: t.run}
+	if t.run != s.run {
+		return ex
+	}
 	s.nextID++
-	entry.ID = s.nextID
+	ex.id, entry.ID, entry.Pending = s.nextID, s.nextID, true
+	record := &activityRecord{ProxyActivity: entry}
+	if capture && t.debug && t.epoch == s.epoch && s.server != nil {
+		record.capture, record.Debug = &proxyCapture{}, true
+		ex.capture = record.capture
+	}
+	s.records = append(s.records, record)
+	s.trimLocked()
+	return ex
+}
+
+// finish completes the entry; counters count completed requests of this run.
+func (s *ProxyService) finish(ex *proxyExchange, method, path string, status int, duration time.Duration, failure string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ex.run != s.run {
+		return
+	}
 	s.requests++
-	if entry.Error != "" || entry.Status >= 500 {
+	if failure != "" || status >= 500 {
 		s.failures++
 	}
-	s.activity = append(s.activity, entry)
-	if len(s.activity) > proxyActivityLimit {
-		s.activity = s.activity[len(s.activity)-proxyActivityLimit:]
+	if r := s.recordLocked(ex.id); r != nil && ex.id != 0 {
+		r.Method, r.Path, r.Status, r.DurationMs, r.Error, r.Pending = method, path, status, duration.Milliseconds(), failure, false
 	}
 }
 
 type proxyHandler struct {
-	route   proxyRoute
-	program *goja.Program
-	shared  *proxyContext
-	client  *http.Client // script http.request calls; redirects are returned, not followed
-	proxy   *httputil.ReverseProxy
-	record  func(ProxyActivity)
-	log     func(level, message string)
+	route  proxyRoute
+	script *proxyScript
+	shared *proxyContext
+	client *http.Client // script http.request calls; redirects are returned, not followed
+	proxy  *httputil.ReverseProxy
+	svc    *ProxyService
+	run    int64
+	log    func(level, message string)
 }
 
-type proxyErrorKey struct{}
-
-func newProxyHandler(route proxyRoute, program *goja.Program, shared *proxyContext, record func(ProxyActivity), logConsole func(level, message string)) *proxyHandler {
+func newProxyHandler(route proxyRoute, script *proxyScript, shared *proxyContext, svc *ProxyService, run int64, logConsole func(level, message string)) *proxyHandler {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	h := &proxyHandler{route: route, program: program, shared: shared, record: record, log: logConsole,
+	h := &proxyHandler{route: route, script: script, shared: shared, svc: svc, run: run, log: logConsole,
 		client: &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone(),
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	h.proxy = &httputil.ReverseProxy{
 		Transport: transport,
-		// Responses are passed through untouched. ReverseProxy flushes
-		// text/event-stream and unknown-length bodies immediately (streaming).
+		// ReverseProxy flushes text/event-stream and unknown-length bodies
+		// immediately (streaming); nothing here reads a body ahead of it.
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme, pr.Out.URL.Host = route.target.Scheme, route.target.Host
 			pr.Out.Host = route.target.Host
+			if ex := exchangeOf(pr.Out.Context()); ex != nil && ex.capture != nil {
+				svc.captureRequest(ex.capture, pr.Out)
+			}
+		},
+		// onResponse runs when the upstream headers arrive, before anything is
+		// written to the client; a failure becomes an explicit proxy error.
+		ModifyResponse: func(res *http.Response) error {
+			if h.script != nil && h.script.onResponse {
+				if err := runResponseHook(res.Request.Context(), h.script, h.client, h.shared, h.log, res); err != nil {
+					return err
+				}
+			}
+			if ex := exchangeOf(res.Request.Context()); ex != nil && ex.capture != nil {
+				svc.captureResponse(ex.capture, res)
+			}
+			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			ex := exchangeOf(r.Context())
+			var failure *scriptFailure
+			if errors.As(err, &failure) {
+				if ex != nil {
+					ex.err = failure.message
+				}
+				w.Header().Set("X-ToolHatch-Proxy-Error", "script")
+				http.Error(w, "ToolHatch proxy: "+failure.message, failure.status)
+				return
+			}
 			message := "Target unreachable: " + describeNetError(err, nil) + "."
 			if r.Context().Err() != nil {
 				message = "Canceled by client or proxy stop."
 			}
-			if holder, ok := r.Context().Value(proxyErrorKey{}).(*string); ok {
-				*holder = message
+			if ex != nil {
+				ex.err = message
 			}
 			w.Header().Set("X-ToolHatch-Proxy-Error", "upstream")
 			http.Error(w, "ToolHatch proxy: "+message, http.StatusBadGateway)
@@ -317,41 +518,42 @@ func newProxyHandler(route proxyRoute, program *goja.Program, shared *proxyConte
 
 func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
+	ticket := h.svc.admit(h.run) // Debug is sampled when the request arrives
 	recorder := &statusRecorder{ResponseWriter: w}
-	var proxyError string
-	out := r.Clone(context.WithValue(r.Context(), proxyErrorKey{}, &proxyError))
+	out := r.Clone(r.Context())
 	if mapped, ok := mapProxyPath(out.URL.EscapedPath(), h.route.source, h.route.targetPath); ok {
 		decoded, _ := url.PathUnescape(mapped)
 		out.URL.Path, out.URL.RawPath = decoded, mapped
 	}
-	entry := ProxyActivity{Time: started.Format(time.RFC3339), Method: r.Method, Path: out.URL.EscapedPath()}
-	finish := func() {
-		entry.Status, entry.DurationMs = recorder.status, time.Since(started).Milliseconds()
-		h.record(entry)
+	method, path := r.Method, out.URL.EscapedPath()
+	var failure *scriptFailure
+	if h.script != nil && h.script.onRequest {
+		if err := runProxyScript(out.Context(), h.script, h.client, h.shared, h.log, out); err != nil {
+			failure = &scriptFailure{http.StatusInternalServerError, err.Error()}
+			errors.As(err, &failure)
+		} else {
+			method, path = out.Method, out.URL.EscapedPath()
+		}
+	}
+	ex := h.svc.begin(ticket, ProxyActivity{Time: started.Format(time.RFC3339), Method: method, Path: path}, failure == nil)
+	finish := func() { h.svc.finish(ex, method, path, recorder.status, time.Since(started), ex.err) }
+	if failure != nil {
+		ex.err = failure.message
+		recorder.Header().Set("X-ToolHatch-Proxy-Error", "script")
+		http.Error(recorder, "ToolHatch proxy: "+failure.message, failure.status)
+		finish()
+		return
 	}
 	defer func() {
 		if v := recover(); v != nil { // ReverseProxy aborts broken streams this way
-			if entry.Error == "" {
-				entry.Error = "Response stream interrupted."
+			if ex.err == "" {
+				ex.err = "Response stream interrupted."
 			}
 			finish()
 			panic(v)
 		}
 	}()
-	if h.program != nil {
-		if err := runProxyScript(out.Context(), h.program, h.client, h.shared, h.log, out); err != nil {
-			failure := &scriptFailure{http.StatusInternalServerError, err.Error()}
-			errors.As(err, &failure)
-			entry.Error = failure.message
-			recorder.Header().Set("X-ToolHatch-Proxy-Error", "script")
-			http.Error(recorder, "ToolHatch proxy: "+failure.message, failure.status)
-			finish()
-			return
-		}
-		entry.Method, entry.Path = out.Method, out.URL.EscapedPath()
-	}
-	h.proxy.ServeHTTP(recorder, out)
-	entry.Error = proxyError
+	h.proxy.ServeHTTP(recorder, out.WithContext(context.WithValue(out.Context(), proxyExchangeKey{}, ex)))
 	finish()
 }
 

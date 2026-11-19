@@ -40,11 +40,21 @@ type scriptFailure struct {
 
 func (f *scriptFailure) Error() string { return f.message }
 
+// proxyScript is the compiled, immutable Program plus the optional hooks it
+// defines. Neither hook defined means plain forwarding.
+type proxyScript struct {
+	program               *goja.Program
+	onRequest, onResponse bool
+}
+
+const proxyHookOnly = "only available while onRequest or onResponse runs"
+
 // compileProxyScript returns nil for an empty script (plain forwarding). Otherwise
-// it compiles once and runs the top level in a throwaway runtime to confirm that
-// onRequest is a function. The compiled Program is immutable and shared; every
-// request runs it in its own Runtime, so no Runtime is used concurrently.
-func compileProxyScript(src string, log func(level, message string)) (*goja.Program, error) {
+// it compiles once and runs the top level in a throwaway runtime to find the
+// optional onRequest/onResponse hooks; a hook that is defined but not a function
+// is an error. The compiled Program is immutable and shared; every hook call runs
+// it in its own Runtime, so no Runtime is used concurrently.
+func compileProxyScript(src string, log func(level, message string)) (*proxyScript, error) {
 	if strings.TrimSpace(src) == "" {
 		return nil, nil
 	}
@@ -57,12 +67,20 @@ func compileProxyScript(src string, log func(level, message string)) (*goja.Prog
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), proxyValidateTimeout)
 	defer cancel()
-	_, stop, err := newProxyRuntime(ctx, program, nil, nil, log)
+	p, stop, err := newProxyRuntime(ctx, program, nil, nil, log)
 	stop()
 	if err != nil {
 		return nil, err
 	}
-	return program, nil
+	script := &proxyScript{program: program}
+	for name, found := range map[string]*bool{"onRequest": &script.onRequest, "onResponse": &script.onResponse} {
+		hook, err := p.hook(name)
+		if err != nil {
+			return nil, err
+		}
+		*found = hook != nil
+	}
+	return script, nil
 }
 
 type proxyRuntime struct {
@@ -70,12 +88,12 @@ type proxyRuntime struct {
 	ctx     context.Context
 	client  *http.Client
 	shared  *proxyContext // the running proxy's shared context; nil while validating
-	active  bool          // http.request and context are only callable while onRequest runs
+	active  bool          // http.request and context are only callable while a hook runs
 	loading bool          // a context.getOrLoad loader is running
 	calls   int
 }
 
-// newProxyRuntime runs the program's top level and returns onRequest. The returned
+// newProxyRuntime runs the program's top level in a fresh Runtime. The returned
 // stop function must always be called to release the interrupt watcher.
 // log receives console output; nil disables console (it is then undefined).
 // shared is the running proxy's context (nil in the Start validation runtime).
@@ -93,19 +111,81 @@ func newProxyRuntime(ctx context.Context, program *goja.Program, client *http.Cl
 	if _, err := p.rt.RunProgram(program); err != nil {
 		return nil, stop, scriptError(ctx, err)
 	}
-	if _, ok := goja.AssertFunction(p.rt.Get("onRequest")); !ok {
-		return nil, stop, errors.New("Script must define function onRequest(req).")
-	}
 	return p, stop, nil
+}
+
+// hook returns the named global function, nil if it is not defined, or an error
+// if it is defined as something other than a function.
+func (p *proxyRuntime) hook(name string) (goja.Callable, error) {
+	value := p.rt.Get(name)
+	if value == nil || goja.IsUndefined(value) {
+		return nil, nil
+	}
+	fn, ok := goja.AssertFunction(value)
+	if !ok {
+		return nil, fmt.Errorf("Script error: %s must be a function when it is defined.", name)
+	}
+	return fn, nil
+}
+
+// callHook runs a hook with the request/response object and maps failures.
+func (p *proxyRuntime) callHook(name string, arg goja.Value) error {
+	hook, err := p.hook(name)
+	if err == nil && hook == nil {
+		err = fmt.Errorf("Script error: %s is no longer defined.", name)
+	}
+	if err != nil {
+		return err
+	}
+	p.active = true
+	result, err := hook(goja.Undefined(), arg)
+	p.active = false
+	if err != nil {
+		return scriptError(p.ctx, err)
+	}
+	return settledPromise(name, result)
+}
+
+// installHeaders adds header(name), headerValues(name), headers(), setHeader,
+// addHeader and removeHeader for h. Repeated values stay separate in h; only
+// the header()/headers() views join them with ", ". guard rejects names the
+// script must not change (nil allows all).
+func installHeaders(rt *goja.Runtime, object *goja.Object, h http.Header, guard func(name string) bool) {
+	check := func(method, name, value string) {
+		if !validHeaderName(name) || !validHeaderValue(value) {
+			panic(rt.NewTypeError(method + ": invalid header name or value"))
+		}
+		if guard != nil && !guard(name) {
+			panic(rt.NewTypeError(method + ": " + http.CanonicalHeaderKey(name) + " is managed by the proxy"))
+		}
+	}
+	_ = object.Set("header", func(name string) goja.Value {
+		values := h.Values(name)
+		if len(values) == 0 {
+			return goja.Undefined()
+		}
+		return rt.ToValue(strings.Join(values, ", "))
+	})
+	_ = object.Set("headerValues", func(name string) []string { return append([]string{}, h.Values(name)...) })
+	_ = object.Set("headers", func() map[string]string {
+		all := map[string]string{}
+		for name, values := range h {
+			all[name] = strings.Join(values, ", ")
+		}
+		return all
+	})
+	_ = object.Set("setHeader", func(name, value string) { check("setHeader", name, value); h.Set(name, value) })
+	_ = object.Set("addHeader", func(name, value string) { check("addHeader", name, value); h.Add(name, value) })
+	_ = object.Set("removeHeader", func(name string) { check("removeHeader", name, ""); h.Del(name) })
 }
 
 // runProxyScript applies onRequest to out. Unread bodies keep streaming from the
 // client; a body that the script reads is buffered (bounded) and re-sent with a
 // correct Content-Length, modified or not.
-func runProxyScript(parent context.Context, program *goja.Program, client *http.Client, shared *proxyContext, log func(level, message string), out *http.Request) error {
+func runProxyScript(parent context.Context, script *proxyScript, client *http.Client, shared *proxyContext, log func(level, message string), out *http.Request) error {
 	ctx, cancel := context.WithTimeout(parent, proxyScriptTimeout)
 	defer cancel()
-	p, stop, err := newProxyRuntime(ctx, program, client, shared, log)
+	p, stop, err := newProxyRuntime(ctx, script.program, client, shared, log)
 	defer stop()
 	if err != nil {
 		return &scriptFailure{http.StatusInternalServerError, err.Error()}
@@ -116,27 +196,7 @@ func runProxyScript(parent context.Context, program *goja.Program, client *http.
 	initialPath := out.URL.EscapedPath()
 	_ = req.Set("method", out.Method)
 	_ = req.Set("path", initialPath)
-	_ = req.Set("header", func(name string) goja.Value {
-		values := out.Header.Values(name)
-		if len(values) == 0 {
-			return goja.Undefined()
-		}
-		return rt.ToValue(strings.Join(values, ", "))
-	})
-	_ = req.Set("headers", func() map[string]string {
-		all := map[string]string{}
-		for name, values := range out.Header {
-			all[name] = strings.Join(values, ", ")
-		}
-		return all
-	})
-	_ = req.Set("setHeader", func(name, value string) {
-		if !validHeaderName(name) || !validHeaderValue(value) {
-			panic(rt.NewTypeError("setHeader: invalid header name or value"))
-		}
-		out.Header.Set(name, value)
-	})
-	_ = req.Set("removeHeader", func(name string) { out.Header.Del(name) })
+	installHeaders(rt, req, out.Header, nil)
 	_ = req.Set("query", func(name string) goja.Value {
 		values := state.queryValues()
 		if !values.Has(name) {
@@ -167,34 +227,27 @@ func runProxyScript(parent context.Context, program *goja.Program, client *http.
 	})
 	_ = req.DefineAccessorProperty("body", getter, setter, goja.FLAG_FALSE, goja.FLAG_TRUE)
 
-	onRequest, _ := goja.AssertFunction(rt.Get("onRequest"))
-	p.active = true
-	result, err := onRequest(goja.Undefined(), req)
-	p.active = false
-	if err == nil {
-		err = settledPromise(ctx, result)
-	}
-	if err != nil {
+	if err := p.callHook("onRequest", req); err != nil {
 		if state.tooLarge {
 			return &scriptFailure{http.StatusRequestEntityTooLarge, "Request body exceeds the 10 MiB script limit."}
 		}
-		return &scriptFailure{http.StatusInternalServerError, scriptError(ctx, err).Error()}
+		return &scriptFailure{http.StatusInternalServerError, err.Error()}
 	}
 	return state.apply(req.Get("method").String(), req.Get("path").String(), initialPath)
 }
 
-// settledPromise supports async onRequest: microtasks have already run, so the
+// settledPromise supports async hooks: microtasks have already run, so the
 // promise must be settled; a rejection is a script error.
-func settledPromise(ctx context.Context, result goja.Value) error {
+func settledPromise(name string, result goja.Value) error {
 	promise, ok := result.Export().(*goja.Promise)
 	if !ok {
 		return nil
 	}
 	switch promise.State() {
 	case goja.PromiseStateRejected:
-		return errors.New("Script error: onRequest rejected: " + clip(promise.Result().String()))
+		return errors.New("Script error: " + name + " rejected: " + clip(promise.Result().String()))
 	case goja.PromiseStatePending:
-		return errors.New("Script error: onRequest returned a promise that never settled (timers and async I/O are not available).")
+		return errors.New("Script error: " + name + " returned a promise that never settled (timers and async I/O are not available).")
 	}
 	return nil
 }
@@ -273,7 +326,7 @@ func (p *proxyRuntime) request(call goja.FunctionCall) goja.Value {
 	rt := p.rt
 	fail := func(message string) { panic(rt.NewGoError(errors.New("http.request: " + message))) }
 	if !p.active || p.client == nil {
-		fail("only available while onRequest runs")
+		fail(proxyHookOnly)
 	}
 	if p.calls++; p.calls > proxyFetchMaxCalls {
 		fail(fmt.Sprintf("at most %d calls per proxied request", proxyFetchMaxCalls))
